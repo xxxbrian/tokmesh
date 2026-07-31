@@ -42,7 +42,7 @@ on:
         type: boolean
         default: true
       npm:
-        description: "Publish to npm (platform packages then tokmesh)"
+        description: "Publish to npm (single package: tokmesh)"
         required: true
         type: boolean
         default: false
@@ -199,39 +199,24 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Stage native binaries from GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/prepare-npm-binaries.py "${{ needs.gate.outputs.version }}" --repo "${{ github.repository }}"
-
+      # Single package `tokmesh`: downloads the matching GitHub Release binary
+      # on postinstall / first run. No platform sub-packages.
       - name: Pack (dry-run style)
-        working-directory: packaging/npm
-        run: |
-          set -euo pipefail
-          for dir in tokmesh-linux-x64 tokmesh-linux-arm64 tokmesh-darwin-x64 tokmesh-darwin-arm64 tokmesh-windows-x64 tokmesh-windows-arm64 tokmesh; do
-            echo "==== npm pack ${dir} ===="
-            (cd "$dir" && npm pack --dry-run)
-          done
+        working-directory: packaging/npm/tokmesh
+        run: npm pack --dry-run
 
       - name: Publish to npm
         if: ${{ inputs.dry_run == false }}
-        working-directory: packaging/npm
+        working-directory: packaging/npm/tokmesh
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
-            echo "ERROR: secrets.NPM_TOKEN is not set." >&2
-            echo "Create an npm Access Token (Automation) and add repo secret NPM_TOKEN." >&2
+            echo "ERROR: secrets.NPM_TOKEN is not set (or use Trusted Publisher / local first publish)." >&2
             exit 1
           fi
-          # Platform packages first, then the meta package that depends on them.
-          for dir in tokmesh-linux-x64 tokmesh-linux-arm64 tokmesh-darwin-x64 tokmesh-darwin-arm64 tokmesh-windows-x64 tokmesh-windows-arm64; do
-            echo "==== npm publish ${dir} ===="
-            (cd "$dir" && npm publish --access public)
-          done
-          echo "==== npm publish tokmesh ===="
-          (cd tokmesh && npm publish --access public)
+          npm publish --access public
 
       - name: Dry-run notice
         if: ${{ inputs.dry_run }}
