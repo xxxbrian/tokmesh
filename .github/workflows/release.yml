@@ -10,6 +10,10 @@
 #
 # Builds the thin `tokmesh` package (short cargo name), which links the
 # `tokmesh-cli` implementation library and produces the `tokmesh` binary.
+#
+# This workflow only builds GitHub Release assets. It does NOT publish to
+# crates.io / npm / PyPI. After binaries succeed, run the manual
+# "Publish registries" workflow with the same version.
 
 name: Release
 
@@ -74,23 +78,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ steps.ver.outputs.version }}"
-          python3 - <<'PY' "$VERSION"
-          import pathlib, re, sys
-          version = sys.argv[1]
-          path = pathlib.Path("Cargo.toml")
-          text = path.read_text()
-          updated, n = re.subn(
-              r'(?m)^(\[workspace\.package\]\n(?:(?!^\[).*\n)*?^version = ")([^"]+)(")',
-              rf"\g<1>{version}\g<3>",
-              text,
-              count=1,
-          )
-          if n != 1:
-              raise SystemExit("failed to patch [workspace.package] version")
-          path.write_text(updated)
-          print(f"workspace version -> {version}")
-          PY
+          python3 scripts/bump-version.py "${{ steps.ver.outputs.version }}"
 
       - uses: Swatinem/rust-cache@v2
         with:
