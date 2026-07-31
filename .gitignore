@@ -7,13 +7,11 @@
 .grok/
 notes/
 scratch/
-upstreams/
 workflow-runs/
 AGENTS.md
 DECISIONS.md
 docs/
 UPSTREAM.md
-upstreams.lock
 *.local.md
 
 **/credentials.json

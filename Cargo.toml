@@ -72,10 +72,6 @@ unicode-width = "0.2"
 # transitively, so this adds no new dependency.
 unicode-segmentation = "1.12"
 
-# Async utilities
-tokio-stream = "0.1"
-futures = "0.3"
-
 # Table output for non-TUI mode
 comfy-table = "7"
 

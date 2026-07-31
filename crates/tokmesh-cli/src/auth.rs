@@ -17,17 +17,10 @@ pub struct Credentials {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiTokenSource {
-    Environment,
-    StoredCredentials,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTokenAuth {
     pub token: String,
     pub username: Option<String>,
-    pub source: ApiTokenSource,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,11 +52,19 @@ struct PollResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct UserInfo {
     username: String,
     #[serde(rename = "avatarUrl")]
     avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PollOutcome {
+    Pending,
+    Complete { token: String, user: UserInfo },
+    Expired,
+    Rejected(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,14 +140,12 @@ pub fn resolve_api_token(board: Leaderboard) -> Option<ApiTokenAuth> {
         return Some(ApiTokenAuth {
             token,
             username: None,
-            source: ApiTokenSource::Environment,
         });
     }
 
     load_credentials(board).map(|credentials| ApiTokenAuth {
         token: credentials.token,
         username: Some(credentials.username),
-        source: ApiTokenSource::StoredCredentials,
     })
 }
 
@@ -221,6 +220,91 @@ fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
     value.clamp(min, max)
 }
 
+fn sanitize_server_text(text: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let cleaned: String = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if cleaned.chars().count() > MAX_CHARS {
+        format!("{}…", cleaned.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        cleaned
+    }
+}
+
+#[cfg(target_os = "windows")]
+const CMD_METACHARACTERS: &[char] = &['&', '|', '<', '>', '^', '"', '%', '!'];
+
+fn validate_verification_url(url: &str) -> Result<()> {
+    if url.chars().any(char::is_control) {
+        anyhow::bail!("Server returned a verification URL containing control characters.");
+    }
+
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| anyhow::anyhow!("Server returned an invalid verification URL."))?;
+    let is_loopback_http = parsed.scheme() == "http"
+        && matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        );
+    if parsed.scheme() != "https" && !is_loopback_http {
+        anyhow::bail!(
+            "Server returned a verification URL with an unsupported scheme: {}",
+            parsed.scheme()
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("Server returned a verification URL containing credentials.");
+    }
+
+    #[cfg(target_os = "windows")]
+    if url.contains(CMD_METACHARACTERS) {
+        anyhow::bail!("Server returned a verification URL containing shell metacharacters.");
+    }
+
+    Ok(())
+}
+
+fn interpret_poll_response(data: PollResponse) -> PollOutcome {
+    match data.status.as_deref() {
+        Some("complete") => match (data.token, data.user) {
+            (Some(token), Some(user)) => PollOutcome::Complete { token, user },
+            _ => PollOutcome::Rejected(
+                "Server returned an incomplete authorization response.".to_string(),
+            ),
+        },
+        Some("expired") => PollOutcome::Expired,
+        _ => match data
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+        {
+            None => PollOutcome::Pending,
+            Some("authorization_pending" | "slow_down") => PollOutcome::Pending,
+            Some(error) => PollOutcome::Rejected(sanitize_server_text(error)),
+        },
+    }
+}
+
+fn poll_sleep_duration(
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+    interval: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let remaining = deadline.checked_duration_since(now)?;
+    (!remaining.is_zero()).then_some(interval.min(remaining))
+}
+
+fn poll_request_timeout(
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let remaining = deadline.checked_duration_since(now)?;
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 pub async fn login(board: Leaderboard) -> Result<()> {
     use colored::Colorize;
 
@@ -267,6 +351,7 @@ pub async fn login(board: Leaderboard) -> Result<()> {
     }
 
     let device_data: DeviceCodeResponse = device_code_response.json().await?;
+    validate_verification_url(&device_data.verification_url)?;
     let poll_interval = std::time::Duration::from_secs(clamp_u64(
         device_data.interval,
         MIN_POLL_INTERVAL_SECS,
@@ -277,7 +362,7 @@ pub async fn login(board: Leaderboard) -> Result<()> {
         MIN_CODE_LIFETIME_SECS,
         MAX_CODE_LIFETIME_SECS,
     );
-    let max_attempts = (lifetime_secs / poll_interval.as_secs().max(1)).max(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(lifetime_secs);
 
     println!();
     println!("{}", "  Open this URL in your browser:".white());
@@ -306,37 +391,33 @@ pub async fn login(board: Leaderboard) -> Result<()> {
 
     println!("{}", "  Waiting for authorization...".bright_black());
 
-    for attempt in 0..max_attempts {
-        tokio::time::sleep(poll_interval).await;
+    loop {
+        let Some(sleep_for) =
+            poll_sleep_duration(std::time::Instant::now(), deadline, poll_interval)
+        else {
+            anyhow::bail!("Timeout: Authorization took too long. Please try again.");
+        };
+        tokio::time::sleep(sleep_for).await;
+
+        let Some(request_timeout) = poll_request_timeout(std::time::Instant::now(), deadline)
+        else {
+            anyhow::bail!("Timeout: Authorization took too long. Please try again.");
+        };
 
         let poll_response = client
             .post(format!("{}/api/auth/device/poll", base_url))
             .json(&serde_json::json!({
                 "deviceCode": device_data.device_code
             }))
+            .timeout(request_timeout)
             .send()
             .await;
 
         match poll_response {
             Ok(response) => {
                 if let Ok(data) = response.json::<PollResponse>().await {
-                    if let Some(err) = data.error.as_deref() {
-                        if data.status.as_deref() != Some("pending")
-                            && data.status.as_deref() != Some("complete")
-                        {
-                            // Surface server error when present and not mid-flow.
-                            if data.status.as_deref() == Some("expired") || data.token.is_none() {
-                                if data.status.as_deref() == Some("expired") {
-                                    anyhow::bail!("Authorization code expired. Please try again.");
-                                }
-                            }
-                            let _ = err;
-                        }
-                    }
-
-                    let status = data.status.as_deref().unwrap_or("");
-                    if status == "complete" {
-                        if let (Some(token), Some(user)) = (data.token, data.user) {
+                    match interpret_poll_response(data) {
+                        PollOutcome::Complete { token, user } => {
                             let credentials = Credentials {
                                 token,
                                 username: user.username.clone(),
@@ -365,10 +446,14 @@ pub async fn login(board: Leaderboard) -> Result<()> {
                             );
                             return Ok(());
                         }
-                    }
-
-                    if status == "expired" {
-                        anyhow::bail!("Authorization code expired. Please try again.");
+                        PollOutcome::Expired => {
+                            anyhow::bail!("Authorization code expired. Please try again.");
+                        }
+                        PollOutcome::Rejected(error) => {
+                            println!();
+                            anyhow::bail!(error);
+                        }
+                        PollOutcome::Pending => {}
                     }
 
                     print!("{}", ".".bright_black());
@@ -383,12 +468,10 @@ pub async fn login(board: Leaderboard) -> Result<()> {
             }
         }
 
-        if attempt >= max_attempts - 1 {
+        if std::time::Instant::now() >= deadline {
             anyhow::bail!("Timeout: Authorization took too long. Please try again.");
         }
     }
-
-    Ok(())
 }
 
 pub async fn login_with_token(board: Leaderboard, token: &str) -> Result<()> {
@@ -657,7 +740,6 @@ mod tests {
             }
             let auth = resolve_api_token(Leaderboard::Tokscale).unwrap();
             assert_eq!(auth.token, "tt_env");
-            assert_eq!(auth.source, ApiTokenSource::Environment);
             unsafe {
                 env::remove_var("TOKMESH_TOKSCALE_API_TOKEN");
             }
@@ -702,5 +784,146 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(v["username"], "user");
         });
+    }
+
+    #[test]
+    #[serial]
+    fn verification_url_allows_https_and_loopback_http() {
+        with_config_dir(|_| {
+            validate_verification_url("https://tokens.ci/device").unwrap();
+            validate_verification_url("http://localhost:3000/device").unwrap();
+            validate_verification_url("http://127.0.0.1:3000/device").unwrap();
+            validate_verification_url("http://[::1]:3000/device").unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn verification_url_rejects_unsafe_urls() {
+        with_config_dir(|_| {
+            for url in [
+                "http://tokens.ci/device",
+                "file:///tmp/device",
+                "https://accounts.example@evil.example/device",
+                "https://tokens.ci/device\u{1b}[2J",
+            ] {
+                assert!(validate_verification_url(url).is_err(), "accepted {url}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn server_text_is_cleaned_and_bounded() {
+        with_config_dir(|_| {
+            assert_eq!(
+                sanitize_server_text("bad\u{1b}[2J\nmessage"),
+                "bad[2Jmessage"
+            );
+            let long = "x".repeat(301);
+            let cleaned = sanitize_server_text(&long);
+            assert_eq!(cleaned.chars().count(), 301);
+            assert!(cleaned.ends_with('…'));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn poll_response_returns_terminal_outcomes() {
+        with_config_dir(|_| {
+            assert_eq!(
+                interpret_poll_response(PollResponse {
+                    status: Some("pending".to_string()),
+                    token: None,
+                    user: None,
+                    error: None,
+                }),
+                PollOutcome::Pending
+            );
+            assert_eq!(
+                interpret_poll_response(PollResponse {
+                    status: Some("complete".to_string()),
+                    token: Some("tt_test".to_string()),
+                    user: Some(UserInfo {
+                        username: "alice".to_string(),
+                        avatar_url: None,
+                    }),
+                    error: None,
+                }),
+                PollOutcome::Complete {
+                    token: "tt_test".to_string(),
+                    user: UserInfo {
+                        username: "alice".to_string(),
+                        avatar_url: None,
+                    }
+                }
+            );
+            assert_eq!(
+                interpret_poll_response(PollResponse {
+                    status: None,
+                    token: None,
+                    user: None,
+                    error: Some("Denied\u{1b}[2J".to_string()),
+                }),
+                PollOutcome::Rejected("Denied[2J".to_string())
+            );
+            assert_eq!(
+                interpret_poll_response(PollResponse {
+                    status: Some("expired".to_string()),
+                    token: None,
+                    user: None,
+                    error: Some("ignored".to_string()),
+                }),
+                PollOutcome::Expired
+            );
+            for error in ["authorization_pending", "slow_down"] {
+                assert_eq!(
+                    interpret_poll_response(PollResponse {
+                        status: Some("pending".to_string()),
+                        token: None,
+                        user: None,
+                        error: Some(error.to_string()),
+                    }),
+                    PollOutcome::Pending
+                );
+            }
+            assert_eq!(
+                interpret_poll_response(PollResponse {
+                    status: Some("pending".to_string()),
+                    token: None,
+                    user: None,
+                    error: Some("access_denied".to_string()),
+                }),
+                PollOutcome::Rejected("access_denied".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn poll_timing_never_starts_or_outlives_the_deadline() {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(10);
+
+        assert_eq!(
+            poll_sleep_duration(start, deadline, std::time::Duration::from_secs(3)),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(
+            poll_sleep_duration(
+                start + std::time::Duration::from_secs(8),
+                deadline,
+                std::time::Duration::from_secs(5)
+            ),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            poll_sleep_duration(deadline, deadline, std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            poll_request_timeout(start + std::time::Duration::from_secs(7), deadline),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(poll_request_timeout(deadline, deadline), None);
     }
 }

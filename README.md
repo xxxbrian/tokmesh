@@ -31,7 +31,7 @@ tokmesh wrapped
 
 Config and caches live under `~/.config/tokmesh/` (override with `TOKMESH_CONFIG_DIR` for an isolated profile).
 
-Data is read **only** from local client logs and databases (Claude Code, Codex, OpenCode, Grok Build, Cursor cache, and many others).
+Usage is derived from local client logs and databases (Claude Code, Codex, OpenCode, Grok Build, Cursor cache, and many others). The TUI may also fetch public leaderboard statistics.
 
 ## Leaderboards
 
@@ -62,7 +62,15 @@ Environment overrides (optional):
 | `TOKMESH_TOKSCALE_API_URL` | Override tokscale API base (tests/mocks) |
 | `TOKMESH_TOKENSCI_API_URL` | Override tokens.ci API base (tests/mocks) |
 
-Only aggregated usage leaves the machine on submit (same privacy model as upstream). Use `--dry-run` to print what would be uploaded without contacting a server.
+Submit sends daily usage aggregates and a stable device identifier. It never sends prompts, completions, file contents, or local paths.
+
+```sh
+tokmesh tokscale submit --dry-run          # human summary
+tokmesh tokensci submit --dry-run --json   # full JSON body (no upload)
+```
+
+`tokmesh tokensci submit --replace --client <id> --since YYYY-MM-DD --until YYYY-MM-DD`
+authoritatively replaces that client's bounded date range; missing local days are removed remotely.
 
 ## TODO
 

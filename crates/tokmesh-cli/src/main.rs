@@ -121,8 +121,16 @@ enum LeaderboardCommand {
         date: DateRangeFlags,
         #[arg(long, help = "Print the payload without uploading")]
         dry_run: bool,
-        #[arg(long, help = "Disable spinner")]
-        no_spinner: bool,
+        #[arg(
+            long,
+            help = "With --dry-run, print the full submit JSON body to stdout"
+        )]
+        json: bool,
+        #[arg(
+            long,
+            help = "Authoritatively replace explicitly selected clients within --since/--until (tokens.ci)"
+        )]
+        replace: bool,
     },
     #[command(about = "Manage periodic usage submission to this leaderboard")]
     Autosubmit {
@@ -4207,6 +4215,16 @@ struct TsSourceContribution {
     tokens: TsTokenBreakdown,
     cost: f64,
     messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<TsClientContributionProvenance>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsClientContributionProvenance {
+    schema_version: u32,
+    message_count: i32,
+    model_count: u32,
 }
 
 #[derive(serde::Serialize)]
@@ -4284,6 +4302,110 @@ struct TsTimeMetrics {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TsClientManifestCoverage {
+    mode: &'static str,
+    start: String,
+    end: String,
+    missing_data: &'static str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsClientManifestEntry {
+    client: String,
+    parser_revision: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<TsClientManifestCoverage>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsClientManifest {
+    schema_version: u32,
+    clients: Vec<TsClientManifestEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubmitReplacementCoverage {
+    clients: Vec<String>,
+    start: String,
+    end: String,
+}
+
+fn resolve_submit_replacement(
+    replace: bool,
+    clients: Option<&[String]>,
+    date: &DateRangeFlags,
+) -> Result<Option<SubmitReplacementCoverage>> {
+    if !replace {
+        return Ok(None);
+    }
+    if date.today || date.yesterday || date.week || date.month || date.year.is_some() {
+        return Err(anyhow::anyhow!(
+            "--replace only accepts explicit --since and --until bounds; remove --today/--yesterday/--week/--month/--year"
+        ));
+    }
+
+    let replacement_clients = clients
+        .filter(|clients| !clients.is_empty())
+        .map(<[String]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!("--replace requires at least one explicit --client"))?;
+    let start = date
+        .since
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--replace requires a bounded --since date"))?;
+    let end = date
+        .until
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--replace requires a bounded --until date"))?;
+    let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("--replace --since must use YYYY-MM-DD"))?;
+    let end_date = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("--replace --until must use YYYY-MM-DD"))?;
+    if start_date > end_date {
+        return Err(anyhow::anyhow!(
+            "--replace --until must be on or after --since"
+        ));
+    }
+
+    Ok(Some(SubmitReplacementCoverage {
+        clients: replacement_clients,
+        start: start.to_string(),
+        end: end.to_string(),
+    }))
+}
+
+fn validate_replacement_contributions(
+    graph: &tokmesh_core::GraphResult,
+    replacement: Option<&SubmitReplacementCoverage>,
+) -> Result<()> {
+    let Some(replacement) = replacement else {
+        return Ok(());
+    };
+
+    let missing: Vec<&str> = replacement
+        .clients
+        .iter()
+        .map(String::as_str)
+        .filter(|client| {
+            !graph.contributions.iter().any(|day| {
+                day.clients
+                    .iter()
+                    .any(|contribution| contribution.client == *client)
+            })
+        })
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "--replace requires at least one local contribution for each selected client after filtering; no contribution found for: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
     meta: TsExportMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4294,13 +4416,79 @@ struct TsTokenContributionData {
     #[serde(skip_serializing_if = "Option::is_none")]
     time_metrics: Option<TsTimeMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mcp_servers: Option<Vec<String>>,
+    client_manifest: Option<TsClientManifest>,
 }
 
+fn submit_parser_revision(client: &str) -> u32 {
+    if client == "codex" {
+        2
+    } else {
+        1
+    }
+}
+
+fn build_submit_client_manifest(
+    graph: &tokmesh_core::GraphResult,
+    replacement: Option<&SubmitReplacementCoverage>,
+) -> TsClientManifest {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut clients = BTreeSet::new();
+    for day in &graph.contributions {
+        for contribution in &day.clients {
+            clients.insert(contribution.client.clone());
+        }
+    }
+    if let Some(replacement) = replacement {
+        clients.extend(replacement.clients.iter().cloned());
+    }
+
+    let replacement_clients: BTreeMap<&str, &SubmitReplacementCoverage> = replacement
+        .into_iter()
+        .flat_map(|coverage| {
+            coverage
+                .clients
+                .iter()
+                .map(move |client| (client.as_str(), coverage))
+        })
+        .collect();
+
+    TsClientManifest {
+        schema_version: 1,
+        clients: clients
+            .into_iter()
+            .map(|client| {
+                let coverage = replacement_clients.get(client.as_str()).map(|replacement| {
+                    TsClientManifestCoverage {
+                        mode: "full",
+                        start: replacement.start.clone(),
+                        end: replacement.end.clone(),
+                        missing_data: "tombstone",
+                    }
+                });
+                TsClientManifestEntry {
+                    parser_revision: submit_parser_revision(&client),
+                    client,
+                    coverage,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Build the leaderboard submit/export body.
+///
+/// - `Leaderboard::Tokscale`: tokscale.ai shape (no clientManifest / provenance).
+/// - `Leaderboard::TokensCi`: tokens.ci shape (clientManifest + per-row provenance on submit).
 fn to_ts_token_contribution_data(
     graph: &tokmesh_core::GraphResult,
     device: Option<&device::SubmitDevice>,
+    board: leaderboard::Leaderboard,
+    replacement: Option<&SubmitReplacementCoverage>,
 ) -> TsTokenContributionData {
+    let tokensci = board == leaderboard::Leaderboard::TokensCi;
+    let include_submit_provenance = tokensci && device.is_some();
+
     TsTokenContributionData {
         meta: TsExportMeta {
             generated_at: graph.meta.generated_at.clone(),
@@ -4314,6 +4502,11 @@ fn to_ts_token_contribution_data(
             id: d.id.clone(),
             name: d.name.clone(),
         }),
+        client_manifest: if tokensci && device.is_some() {
+            Some(build_submit_client_manifest(graph, replacement))
+        } else {
+            None
+        },
         summary: TsDataSummary {
             total_tokens: graph.summary.total_tokens,
             total_cost: graph.summary.total_cost,
@@ -4340,22 +4533,8 @@ fn to_ts_token_contribution_data(
         contributions: graph
             .contributions
             .iter()
-            .map(|d| TsDailyContribution {
-                date: d.date.clone(),
-                totals: TsDailyTotals {
-                    tokens: d.totals.tokens,
-                    cost: d.totals.cost,
-                    messages: d.totals.messages,
-                },
-                intensity: d.intensity,
-                token_breakdown: TsTokenBreakdown {
-                    input: d.token_breakdown.input,
-                    output: d.token_breakdown.output,
-                    cache_read: d.token_breakdown.cache_read,
-                    cache_write: d.token_breakdown.cache_write,
-                    reasoning: d.token_breakdown.reasoning,
-                },
-                clients: d
+            .map(|d| {
+                let mut clients: Vec<TsSourceContribution> = d
                     .clients
                     .iter()
                     .map(|s| TsSourceContribution {
@@ -4375,9 +4554,35 @@ fn to_ts_token_contribution_data(
                         },
                         cost: s.cost,
                         messages: s.messages,
+                        provenance: include_submit_provenance.then(|| {
+                            TsClientContributionProvenance {
+                                schema_version: submit_parser_revision(&s.client),
+                                message_count: s.messages,
+                                model_count: 1,
+                            }
+                        }),
                     })
-                    .collect(),
-                active_time_ms: d.active_time_ms,
+                    .collect();
+                // Stable order for deterministic dry-run / diffs.
+                clients.sort_by(|a, b| (&a.client, &a.model_id).cmp(&(&b.client, &b.model_id)));
+                TsDailyContribution {
+                    date: d.date.clone(),
+                    totals: TsDailyTotals {
+                        tokens: d.totals.tokens,
+                        cost: d.totals.cost,
+                        messages: d.totals.messages,
+                    },
+                    intensity: d.intensity,
+                    token_breakdown: TsTokenBreakdown {
+                        input: d.token_breakdown.input,
+                        output: d.token_breakdown.output,
+                        cache_read: d.token_breakdown.cache_read,
+                        cache_write: d.token_breakdown.cache_write,
+                        reasoning: d.token_breakdown.reasoning,
+                    },
+                    clients,
+                    active_time_ms: d.active_time_ms,
+                }
             })
             .collect(),
         time_metrics: graph.time_metrics.as_ref().map(|tm| TsTimeMetrics {
@@ -4386,14 +4591,6 @@ fn to_ts_token_contribution_data(
             max_concurrent_sessions: tm.max_concurrent_sessions,
             session_count: tm.session_count,
         }),
-        mcp_servers: {
-            let servers = tokmesh_core::mcp::discover_mcp_server_names(None);
-            if servers.is_empty() {
-                None
-            } else {
-                Some(servers)
-            }
-        },
     }
 }
 
@@ -4417,25 +4614,54 @@ fn run_leaderboard_command(
             clients,
             date,
             dry_run,
-            no_spinner: _,
+            json,
+            replace,
         } => {
             let (since, until) = build_date_filter(&date);
             let year = normalize_year_filter(&date);
-            // Bypass settings.json defaultClients for submit: use submit-specific defaults.
-            let clients = build_client_filter_with_defaults(clients, &[]);
+            let client_filter = build_client_filter_with_defaults(clients, &[]);
+            if replace && board != leaderboard::Leaderboard::TokensCi {
+                anyhow::bail!("--replace is only supported for `tokmesh tokensci submit`");
+            }
+            if json && !dry_run {
+                anyhow::bail!("--json is only valid together with --dry-run");
+            }
+            let replacement = resolve_submit_replacement(replace, client_filter.as_deref(), &date)?;
             run_submit_command(
                 board,
-                clients,
-                since,
-                until,
-                year,
-                dry_run,
-                SubmitMode::Interactive,
+                SubmitCommandOptions {
+                    clients: client_filter,
+                    since,
+                    until,
+                    year,
+                    dry_run,
+                    dry_run_json: json,
+                    replacement,
+                    mode: SubmitMode::Interactive,
+                },
             )
         }
         LeaderboardCommand::Autosubmit { subcommand } => run_autosubmit_command(board, subcommand),
         LeaderboardCommand::DeleteSubmittedData => run_delete_data_command(board),
     }
+}
+
+fn build_leaderboard_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(timeout)
+        .build()
+        .map_err(|error| anyhow::anyhow!("Failed to build leaderboard HTTP client: {error}"))
+}
+
+async fn read_leaderboard_response_body(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<String> {
+    response
+        .text()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to read {operation} response body: {error}"))
 }
 
 fn run_delete_data_command(board: leaderboard::Leaderboard) -> Result<()> {
@@ -4501,8 +4727,9 @@ fn run_delete_data_command(board: leaderboard::Leaderboard) -> Result<()> {
     let api_url = auth::get_api_base_url(board);
     let rt = Runtime::new()?;
 
+    let client = build_leaderboard_http_client(std::time::Duration::from_secs(30))?;
     let response = rt.block_on(async {
-        reqwest::Client::new()
+        client
             .delete(format!("{}/api/settings/submitted-data", api_url))
             .header("Authorization", format!("Bearer {}", auth_token.token))
             .send()
@@ -4512,19 +4739,23 @@ fn run_delete_data_command(board: leaderboard::Leaderboard) -> Result<()> {
     match response {
         Ok(resp) => {
             let status = resp.status();
-            let body: serde_json::Value =
-                rt.block_on(async { resp.json().await }).unwrap_or_default();
+            let body = rt.block_on(read_leaderboard_response_body(resp, "delete"))?;
 
             match interpret_delete_submitted_data_response(status, &body)? {
                 DeleteSubmittedDataOutcome::Deleted(count) => {
-                    println!(
-                        "{}",
-                        format!(
-                            "  ✓ Deleted {} submission(s). Leaderboard and profile will refresh shortly.",
-                            count
-                        )
-                        .green()
+                    let message = count.map_or_else(
+                        || {
+                            "  Submitted data deleted. Leaderboard and profile will refresh shortly."
+                                .to_string()
+                        },
+                        |count| {
+                            format!(
+                                "  Deleted {} submission(s). Leaderboard and profile will refresh shortly.",
+                                count
+                            )
+                        },
                     );
+                    println!("{}", message.green());
                 }
                 DeleteSubmittedDataOutcome::NotFound => {
                     println!("{}", "  No submitted data found for this account.".yellow());
@@ -4541,23 +4772,26 @@ fn run_delete_data_command(board: leaderboard::Leaderboard) -> Result<()> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum DeleteSubmittedDataOutcome {
-    Deleted(i64),
+    Deleted(Option<i64>),
     NotFound,
 }
 
 fn interpret_delete_submitted_data_response(
     status: reqwest::StatusCode,
-    body: &serde_json::Value,
+    body: &str,
 ) -> Result<DeleteSubmittedDataOutcome> {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
     if status.is_success() {
-        let deleted = body
-            .get("deleted")
+        let deleted = parsed
+            .as_ref()
+            .and_then(|body| body.get("deleted"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let count = body
-            .get("deletedSubmissions")
+            .unwrap_or(true);
+        let count = parsed
+            .as_ref()
+            .and_then(|body| body.get("deletedSubmissions"))
             .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+            .or(deleted.then_some(0).filter(|_| parsed.is_some()));
 
         if deleted {
             Ok(DeleteSubmittedDataOutcome::Deleted(count))
@@ -4565,10 +4799,12 @@ fn interpret_delete_submitted_data_response(
             Ok(DeleteSubmittedDataOutcome::NotFound)
         }
     } else {
-        let err = body
-            .get("error")
+        let err = parsed
+            .as_ref()
+            .and_then(|body| body.get("error"))
             .and_then(|v| v.as_str())
-            .unwrap_or("Unknown error");
+            .map(str::to_string)
+            .unwrap_or_else(|| bounded_response_text(body));
         Err(anyhow::anyhow!("Failed ({}): {}", status, err))
     }
 }
@@ -4736,7 +4972,12 @@ fn run_graph_command(
     emit_cursor_setup_warnings(&cursor_setup_warnings);
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
-    let output_data = to_ts_token_contribution_data(&graph_result, None);
+    let output_data = to_ts_token_contribution_data(
+        &graph_result,
+        None,
+        leaderboard::Leaderboard::Tokscale,
+        None,
+    );
     let json_output = serde_json::to_string_pretty(&output_data)?;
 
     if let Some(output_path) = output {
@@ -4966,13 +5207,8 @@ fn run_import_command(
         return Ok(());
     }
 
-    let mut payload = to_ts_token_contribution_data(graph, None);
-    // The imported data has no MCP provenance of its own — it's derived
-    // purely from a third-party clawdboard export. Reusing the graph/submit
-    // converter would otherwise embed the *local* machine's configured MCP
-    // server names, leaking unrelated metadata into a file that should only
-    // reflect the export's contents.
-    payload.mcp_servers = None;
+    let payload =
+        to_ts_token_contribution_data(graph, None, leaderboard::Leaderboard::Tokscale, None);
     let json_output = serde_json::to_string_pretty(&payload)?;
 
     if let Some(output_path) = output {
@@ -4998,7 +5234,7 @@ fn run_import_command(
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct SubmitResponse {
     #[serde(rename = "submissionId")]
     submission_id: Option<String>,
@@ -5010,7 +5246,7 @@ struct SubmitResponse {
     details: Option<Vec<String>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct SubmitMetrics {
     #[serde(rename = "totalTokens")]
     total_tokens: Option<i64>,
@@ -5020,6 +5256,49 @@ struct SubmitMetrics {
     active_days: Option<i32>,
     #[allow(dead_code)]
     sources: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+enum SubmitResponseOutcome {
+    Success(SubmitResponse),
+    Failure { error: String, details: Vec<String> },
+}
+
+fn bounded_response_text(body: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let cleaned: String = body
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_CHARS)
+        .collect();
+    if cleaned.is_empty() {
+        "Unknown error".to_string()
+    } else if body
+        .chars()
+        .filter(|character| !character.is_control())
+        .count()
+        > MAX_CHARS
+    {
+        format!("{cleaned}...")
+    } else {
+        cleaned
+    }
+}
+
+fn interpret_submit_response(status: reqwest::StatusCode, body: &str) -> SubmitResponseOutcome {
+    let parsed = serde_json::from_str::<SubmitResponse>(body).ok();
+    if status.is_success() {
+        return SubmitResponseOutcome::Success(parsed.unwrap_or_default());
+    }
+
+    let error = parsed
+        .as_ref()
+        .and_then(|response| response.error.clone())
+        .unwrap_or_else(|| bounded_response_text(body));
+    let details = parsed
+        .and_then(|response| response.details)
+        .unwrap_or_default();
+    SubmitResponseOutcome::Failure { error, details }
 }
 
 /// A client row dropped from a submission because it carried cost without any
@@ -5182,6 +5461,17 @@ enum SubmitMode {
     Autosubmit,
 }
 
+struct SubmitCommandOptions {
+    clients: Option<Vec<String>>,
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    dry_run: bool,
+    dry_run_json: bool,
+    replacement: Option<SubmitReplacementCoverage>,
+    mode: SubmitMode,
+}
+
 fn run_autosubmit_command(
     board: leaderboard::Leaderboard,
     subcommand: commands::autosubmit::AutosubmitSubcommand,
@@ -5217,12 +5507,16 @@ fn run_autosubmit_command(
             let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
             match run_submit_command(
                 board,
-                clients,
-                since,
-                until,
-                year,
-                false,
-                SubmitMode::Autosubmit,
+                SubmitCommandOptions {
+                    clients,
+                    since,
+                    until,
+                    year,
+                    dry_run: false,
+                    dry_run_json: false,
+                    replacement: None,
+                    mode: SubmitMode::Autosubmit,
+                },
             ) {
                 Ok(()) => {
                     commands::autosubmit::record_run_success(
@@ -5243,43 +5537,55 @@ fn run_autosubmit_command(
 
 fn run_submit_command(
     board: leaderboard::Leaderboard,
-    clients: Option<Vec<String>>,
-    since: Option<String>,
-    until: Option<String>,
-    year: Option<String>,
-    dry_run: bool,
-    mode: SubmitMode,
+    options: SubmitCommandOptions,
 ) -> Result<()> {
     use colored::Colorize;
     use tokio::runtime::Runtime;
     use tokmesh_core::{generate_graph, GroupBy, ReportOptions};
 
-    let auth_token = match auth::resolve_api_token(board) {
-        Some(token) => token,
-        None => {
-            if mode == SubmitMode::Autosubmit {
-                return Err(anyhow::anyhow!(
-                    "Autosubmit requires login to {}. Run `tokmesh {} login` or set {}.",
-                    board,
-                    board.as_str(),
-                    board.api_token_env()
-                ));
+    let SubmitCommandOptions {
+        clients,
+        since,
+        until,
+        year,
+        dry_run,
+        dry_run_json,
+        replacement,
+        mode,
+    } = options;
+
+    let auth_token = if dry_run {
+        None
+    } else {
+        match auth::resolve_api_token(board) {
+            Some(token) => Some(token),
+            None => {
+                if mode == SubmitMode::Autosubmit {
+                    return Err(anyhow::anyhow!(
+                        "Autosubmit requires login to {}. Run `tokmesh {} login` or set {}.",
+                        board,
+                        board.as_str(),
+                        board.api_token_env()
+                    ));
+                }
+                eprintln!("\n  {}", format!("Not logged in to {}.", board).yellow());
+                eprintln!(
+                    "{}",
+                    format!(
+                        "  Run 'tokmesh {} login' or set {}.\n",
+                        board.as_str(),
+                        board.api_token_env()
+                    )
+                    .bright_black()
+                );
+                std::process::exit(1);
             }
-            eprintln!("\n  {}", format!("Not logged in to {}.", board).yellow());
-            eprintln!(
-                "{}",
-                format!(
-                    "  Run 'tokmesh {} login' or set {}.\n",
-                    board.as_str(),
-                    board.api_token_env()
-                )
-                .bright_black()
-            );
-            std::process::exit(1);
         }
     };
 
-    println!("\n  {}\n", format!("Tokmesh → {} — Submit", board).cyan());
+    if !dry_run_json {
+        println!("\n  {}\n", format!("Tokmesh → {} — Submit", board).cyan());
+    }
 
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let explicit_warp_filter = client_filter_explicitly_requests_warp(&clients);
@@ -5291,16 +5597,18 @@ fn run_submit_command(
     let report_home: Option<String> = None;
     let has_cursor_cache = has_cursor_usage_cache_for_report(&report_home);
     if include_cursor && cursor::is_cursor_logged_in() {
-        println!("{}", "  Syncing Cursor usage data...".bright_black());
+        if !dry_run_json {
+            println!("{}", "  Syncing Cursor usage data...".bright_black());
+        }
         let rt_sync = Runtime::new()?;
         let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache().await });
-        if sync_result.synced {
+        if sync_result.synced && !dry_run_json {
             println!(
                 "{}",
                 format!("  Cursor: {} usage events synced", sync_result.rows).bright_black()
             );
         } else if let Some(err) = sync_result.error {
-            if has_cursor_cache {
+            if has_cursor_cache && !dry_run_json {
                 println!(
                     "{}",
                     format!("  Cursor sync failed; using cached data: {}", err).yellow()
@@ -5313,7 +5621,9 @@ fn run_submit_command(
         emit_cursor_setup_warnings(&cursor_setup_warnings);
     }
 
-    println!("{}", "  Scanning local session data...".bright_black());
+    if !dry_run_json {
+        println!("{}", "  Scanning local session data...".bright_black());
+    }
 
     let rt = Runtime::new()?;
     let mut graph_result = rt
@@ -5339,66 +5649,86 @@ fn run_submit_command(
     // record per-request cost with empty token columns) and report what was
     // left out, so a single legacy charge can't block the whole submission.
     let excluded_rows = exclude_tokenless_cost_contributions(&mut graph_result);
-    report_excluded_tokenless_rows(&excluded_rows);
+    if !dry_run_json {
+        report_excluded_tokenless_rows(&excluded_rows);
+    }
+    validate_replacement_contributions(&graph_result, replacement.as_ref())?;
 
-    println!("{}", "  Data to submit:".white());
-    println!(
-        "{}",
-        format!(
-            "    Date range: {} to {}",
-            graph_result.meta.date_range_start, graph_result.meta.date_range_end,
-        )
-        .bright_black()
-    );
-    println!(
-        "{}",
-        format!("    Active days: {}", graph_result.summary.active_days).bright_black()
-    );
-    println!(
-        "{}",
-        format!(
-            "    Total tokens: {}",
-            format_tokens_with_commas(graph_result.summary.total_tokens)
-        )
-        .bright_black()
-    );
-    println!(
-        "{}",
-        format!(
-            "    Total cost: {}",
-            format_currency(graph_result.summary.total_cost)
-        )
-        .bright_black()
-    );
-    println!(
-        "{}",
-        format!("    Clients: {}", graph_result.summary.clients.join(", ")).bright_black()
-    );
-    println!(
-        "{}",
-        format!("    Models: {} models", graph_result.summary.models.len()).bright_black()
-    );
-    println!();
+    if !dry_run_json {
+        println!("{}", "  Data to submit:".white());
+        println!(
+            "{}",
+            format!(
+                "    Date range: {} to {}",
+                graph_result.meta.date_range_start, graph_result.meta.date_range_end,
+            )
+            .bright_black()
+        );
+        println!(
+            "{}",
+            format!("    Active days: {}", graph_result.summary.active_days).bright_black()
+        );
+        println!(
+            "{}",
+            format!(
+                "    Total tokens: {}",
+                format_tokens_with_commas(graph_result.summary.total_tokens)
+            )
+            .bright_black()
+        );
+        println!(
+            "{}",
+            format!(
+                "    Total cost: {}",
+                format_currency(graph_result.summary.total_cost)
+            )
+            .bright_black()
+        );
+        println!(
+            "{}",
+            format!("    Clients: {}", graph_result.summary.clients.join(", ")).bright_black()
+        );
+        println!(
+            "{}",
+            format!("    Models: {} models", graph_result.summary.models.len()).bright_black()
+        );
+        println!();
+    }
 
     if graph_result.summary.total_tokens == 0 {
+        if dry_run_json {
+            // Still emit an empty-ish payload path? Prefer explicit error for scripts.
+            anyhow::bail!("No usage data found to submit.");
+        }
         println!("{}", "  No usage data found to submit.\n".yellow());
         return Ok(());
     }
 
+    let submit_device = device::resolve_submit_device()?;
+    let submit_payload = to_ts_token_contribution_data(
+        &graph_result,
+        Some(&submit_device),
+        board,
+        replacement.as_ref(),
+    );
+
     if dry_run {
-        println!("{}", "  Dry run - not submitting data.\n".yellow());
+        if dry_run_json {
+            println!("{}", serde_json::to_string_pretty(&submit_payload)?);
+        } else {
+            println!("{}", "  Dry run - not submitting data.\n".yellow());
+        }
         return Ok(());
     }
 
     println!("{}", "  Submitting to server...".bright_black());
 
     let api_url = auth::get_api_base_url(board);
-
-    let submit_device = device::resolve_submit_device()?;
-    let submit_payload = to_ts_token_contribution_data(&graph_result, Some(&submit_device));
+    let auth_token = auth_token.expect("non-dry-run submit must resolve authentication");
+    let client = build_leaderboard_http_client(std::time::Duration::from_secs(120))?;
 
     let response = rt.block_on(async {
-        reqwest::Client::new()
+        client
             .post(format!("{}/api/submit", api_url))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", auth_token.token))
@@ -5410,37 +5740,21 @@ fn run_submit_command(
     match response {
         Ok(resp) => {
             let status = resp.status();
-            let body: SubmitResponse =
-                rt.block_on(async { resp.json().await })
-                    .unwrap_or_else(|_| SubmitResponse {
-                        submission_id: None,
-                        username: None,
-                        metrics: None,
-                        warnings: None,
-                        error: Some(format!(
-                            "Server returned {} with unparseable response",
-                            status
-                        )),
-                        details: None,
-                    });
-
-            if !status.is_success() {
-                let error = body
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "Submission failed".to_string());
-                eprintln!("\n  {}", format!("Error: {}", error).red());
-                if let Some(details) = body.details {
+            let response_body = rt.block_on(read_leaderboard_response_body(resp, "submit"))?;
+            let body = match interpret_submit_response(status, &response_body) {
+                SubmitResponseOutcome::Success(body) => body,
+                SubmitResponseOutcome::Failure { error, details } => {
+                    eprintln!("\n  {}", format!("Error: {}", error).red());
                     for detail in details {
                         eprintln!("{}", format!("    - {}", detail).bright_black());
                     }
+                    println!();
+                    if mode == SubmitMode::Autosubmit {
+                        return Err(anyhow::anyhow!(error));
+                    }
+                    std::process::exit(1);
                 }
-                println!();
-                if mode == SubmitMode::Autosubmit {
-                    return Err(anyhow::anyhow!(error));
-                }
-                std::process::exit(1);
-            }
+            };
 
             println!("\n  {}", "Successfully submitted!".green());
             println!();
@@ -6971,25 +7285,101 @@ mod tests {
         let body = serde_json::json!({
             "deleted": true,
             "deletedSubmissions": 2
-        });
+        })
+        .to_string();
 
         let outcome = interpret_delete_submitted_data_response(StatusCode::OK, &body).unwrap();
         match outcome {
-            DeleteSubmittedDataOutcome::Deleted(count) => assert_eq!(count, 2),
+            DeleteSubmittedDataOutcome::Deleted(count) => assert_eq!(count, Some(2)),
             DeleteSubmittedDataOutcome::NotFound => panic!("expected deleted outcome"),
         }
+    }
+
+    #[test]
+    fn test_interpret_delete_submitted_data_response_accepts_non_json_2xx() {
+        assert_eq!(
+            interpret_delete_submitted_data_response(StatusCode::NO_CONTENT, "").unwrap(),
+            DeleteSubmittedDataOutcome::Deleted(None)
+        );
+        assert_eq!(
+            interpret_delete_submitted_data_response(StatusCode::OK, "deleted").unwrap(),
+            DeleteSubmittedDataOutcome::Deleted(None)
+        );
     }
 
     #[test]
     fn test_interpret_delete_submitted_data_response_failure() {
         let body = serde_json::json!({
             "error": "Not authenticated"
-        });
+        })
+        .to_string();
 
         let err = interpret_delete_submitted_data_response(StatusCode::UNAUTHORIZED, &body)
             .unwrap_err()
             .to_string();
         assert!(err.contains("Failed (401 Unauthorized): Not authenticated"));
+    }
+
+    #[test]
+    fn test_interpret_submit_response_accepts_non_json_2xx() {
+        assert!(matches!(
+            interpret_submit_response(StatusCode::NO_CONTENT, ""),
+            SubmitResponseOutcome::Success(SubmitResponse {
+                submission_id: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            interpret_submit_response(StatusCode::OK, "accepted"),
+            SubmitResponseOutcome::Success(_)
+        ));
+    }
+
+    #[test]
+    fn test_interpret_submit_response_preserves_json_failure_details() {
+        let outcome = interpret_submit_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"error":"Invalid contribution","details":["bad date"]}"#,
+        );
+        match outcome {
+            SubmitResponseOutcome::Failure { error, details } => {
+                assert_eq!(error, "Invalid contribution");
+                assert_eq!(details, vec!["bad date"]);
+            }
+            SubmitResponseOutcome::Success(_) => panic!("expected failure"),
+        }
+    }
+
+    #[test]
+    fn test_leaderboard_response_body_read_error_is_not_treated_as_empty() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let bytes_read = stream.read(&mut request).unwrap();
+            assert!(bytes_read > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort",
+                )
+                .unwrap();
+        });
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let response = runtime
+            .block_on(reqwest::get(format!("http://{address}")))
+            .unwrap();
+        let error = runtime
+            .block_on(read_leaderboard_response_body(response, "submit"))
+            .unwrap_err()
+            .to_string();
+        server.join().unwrap();
+
+        assert!(error.contains("Failed to read submit response body"));
     }
 
     #[test]
@@ -7614,13 +8004,46 @@ mod tests {
             name: Some("Test device".to_string()),
         };
 
-        let payload = to_ts_token_contribution_data(&graph, Some(&device));
+        let payload = to_ts_token_contribution_data(
+            &graph,
+            Some(&device),
+            leaderboard::Leaderboard::Tokscale,
+            None,
+        );
 
         assert_eq!(payload.device.as_ref().unwrap().id, "dev_test");
         assert_eq!(
             payload.device.as_ref().unwrap().name.as_deref(),
             Some("Test device")
         );
+    }
+
+    #[test]
+    fn replacement_validation_requires_filtered_contributions_for_each_client() {
+        let graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-12-31",
+            20,
+            2.50,
+            "opencode",
+            "model-b",
+        )]);
+        let replacement = SubmitReplacementCoverage {
+            clients: vec!["opencode".to_string(), "codex".to_string()],
+            start: "2026-12-01".to_string(),
+            end: "2026-12-31".to_string(),
+        };
+
+        let error = validate_replacement_contributions(&graph, Some(&replacement))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no contribution found for: codex"));
+
+        let replacement = SubmitReplacementCoverage {
+            clients: vec!["opencode".to_string()],
+            ..replacement
+        };
+        validate_replacement_contributions(&graph, Some(&replacement)).unwrap();
+        validate_replacement_contributions(&graph, None).unwrap();
     }
 
     #[test]

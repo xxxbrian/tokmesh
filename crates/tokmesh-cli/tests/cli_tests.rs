@@ -246,6 +246,25 @@ fn create_empty_fixture_dir() -> TempDir {
     tmp
 }
 
+fn create_opencodereview_fixture_dir() -> TempDir {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let base = tmp.path();
+    prime_pricing_cache(base);
+    let session_dir = base.join(".opencodereview/sessions/test-repo");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("session-1.jsonl"),
+        concat!(
+            r#"{"type":"session_start","sessionId":"session-1","timestamp":"2026-01-15T10:00:00Z","cwd":"/workspace/project","model":"gpt-4o"}"#,
+            "\n",
+            r#"{"type":"llm_response","sessionId":"session-1","timestamp":"2026-01-15T10:00:05Z","model":"gpt-4o","duration_ms":1500,"usage":{"prompt_tokens":1000,"completion_tokens":250,"cache_read_tokens":100,"cache_write_tokens":50}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    tmp
+}
+
 fn create_timezone_boundary_fixture_dir() -> TempDir {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let base = tmp.path();
@@ -999,62 +1018,6 @@ fn test_whoami_command_help() {
 }
 
 #[test]
-fn test_root_help_exposes_only_scoped_leaderboards() {
-    let output = cargo_bin_cmd!("tokmesh").arg("--help").output().unwrap();
-    assert!(output.status.success());
-    let help = String::from_utf8_lossy(&output.stdout);
-    assert!(help
-        .lines()
-        .any(|line| line.trim_start().starts_with("tokscale ")));
-    assert!(help
-        .lines()
-        .any(|line| line.trim_start().starts_with("tokensci ")));
-    for command in [
-        "login",
-        "logout",
-        "whoami",
-        "qr",
-        "submit",
-        "autosubmit",
-        "delete-submitted-data",
-    ] {
-        assert!(
-            !help
-                .lines()
-                .any(|line| line.split_whitespace().next() == Some(command)),
-            "legacy top-level command leaked into root help: {command}\n{help}"
-        );
-    }
-}
-
-#[test]
-fn test_legacy_top_level_leaderboard_commands_are_rejected() {
-    for command in [
-        "login",
-        "logout",
-        "whoami",
-        "qr",
-        "submit",
-        "autosubmit",
-        "delete-submitted-data",
-    ] {
-        cargo_bin_cmd!("tokmesh").arg(command).assert().failure();
-    }
-}
-
-#[test]
-fn test_scoped_submit_help_has_no_replace_flag() {
-    for board in ["tokscale", "tokensci"] {
-        let output = cargo_bin_cmd!("tokmesh")
-            .args([board, "submit", "--help"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("--replace"));
-    }
-}
-
-#[test]
 fn test_autosubmit_dispatch_keeps_leaderboards_independent() {
     let tmp = create_empty_fixture_dir();
     let config_dir = tmp.path().join(".config/tokmesh");
@@ -1472,8 +1435,8 @@ fn test_models_with_no_matching_date() {
 #[test]
 fn test_graph_single_day_filter_uses_local_timezone_boundaries() {
     let tmp = create_timezone_boundary_fixture_dir();
+    write_settings_json(tmp.path(), r#"{"bucketTimezone":"America/Los_Angeles"}"#);
     let output = cmd_with_home(tmp.path())
-        .env("TZ", "America/Los_Angeles")
         .args(["graph", "--client", "opencode", "--no-spinner"])
         .args(["--since", "2026-03-02", "--until", "2026-03-02"])
         .output()
@@ -1494,6 +1457,33 @@ fn test_graph_single_day_filter_uses_local_timezone_boundaries() {
     );
     assert_eq!(contributions[0]["date"].as_str().unwrap(), "2026-03-02");
     assert_eq!(contributions[0]["totals"]["messages"].as_i64().unwrap(), 2);
+}
+
+#[test]
+fn test_graph_opencodereview_uses_unified_parse_path() {
+    let tmp = create_opencodereview_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["graph", "--client", "opencodereview", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let contribution = &json["contributions"][0];
+    assert_eq!(contribution["totals"]["tokens"].as_i64(), Some(1400));
+    assert_eq!(contribution["totals"]["messages"].as_i64(), Some(1));
+    assert_eq!(
+        contribution["clients"][0]["client"].as_str(),
+        Some("opencodereview")
+    );
+    assert_eq!(
+        contribution["clients"][0]["modelId"].as_str(),
+        Some("gpt-4o")
+    );
 }
 
 #[test]
@@ -1849,9 +1839,9 @@ fn test_submit_cursor_explicit_missing_cache_reports_setup_warning_text() {
 #[test]
 fn test_submit_dry_run_preserves_local_date_ahead_of_utc() {
     let (tmp, expected_local_date) = create_positive_utc_offset_submit_fixture_dir();
+    write_settings_json(tmp.path(), r#"{"bucketTimezone":"Pacific/Kiritimati"}"#);
 
     leaderboard_cmd_with_home(tmp.path())
-        .env("TZ", "Pacific/Kiritimati")
         .env("TOKMESH_TOKSCALE_API_TOKEN", "test-token")
         .args(["tokscale", "submit", "--client", "opencode", "--dry-run"])
         .assert()
@@ -1860,6 +1850,60 @@ fn test_submit_dry_run_preserves_local_date_ahead_of_utc() {
             "Date range: {expected_local_date} to {expected_local_date}"
         )))
         .stdout(predicate::str::contains("Total tokens: 1,750"));
+}
+
+#[test]
+fn test_submit_dry_run_json_is_pure_json_and_needs_no_token() {
+    let tmp = create_temp_fixture_dir();
+    let output = leaderboard_cmd_with_home(tmp.path())
+        .args([
+            "tokensci",
+            "submit",
+            "--client",
+            "opencode",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "stdout was not pure JSON: {error}; stdout={}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert!(payload.get("summary").is_some());
+    assert!(payload.get("clientManifest").is_some());
+    assert!(tmp.path().join(".config/tokmesh/device.json").exists());
+}
+
+#[test]
+fn test_submit_replace_validates_filtered_client_contributions() {
+    let tmp = create_temp_fixture_dir();
+    leaderboard_cmd_with_home(tmp.path())
+        .args([
+            "tokensci",
+            "submit",
+            "--client",
+            "opencode,codex",
+            "--since",
+            "2024-01-01",
+            "--until",
+            "2025-12-31",
+            "--replace",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no contribution found for: codex"));
 }
 
 #[test]
@@ -3597,6 +3641,7 @@ fn test_submit_offline_without_pricing_cache_fails() {
     write_fake_credentials(tmp.path());
 
     let output = offline_cmd_with_home(tmp.path())
+        .env("TOKMESH_CONFIG_DIR", tmp.path().join(".config/tokmesh"))
         .args(["tokscale", "submit", "--client", "opencode", "--dry-run"])
         .output()
         .unwrap();
@@ -3651,7 +3696,6 @@ fn test_models_with_client_filter_gjc() {
     write_gjc_session_fixture(tmp.path());
 
     let output = gjc_cmd_with_home(tmp.path())
-        .env("TOKMESH_CONFIG_DIR", tmp.path().join(".config/tokmesh"))
         .args(["models", "--json", "--client", "gjc", "--no-spinner"])
         .output()
         .unwrap();
