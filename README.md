@@ -33,6 +33,15 @@ Config and caches live under `~/.config/tokmesh/` (override with `TOKMESH_CONFIG
 
 Usage is derived from local client logs and databases (Claude Code, Codex, OpenCode, Grok Build, Cursor cache, and many others). The TUI may also fetch public leaderboard statistics.
 
+### Model identity
+
+Local reports and leaderboard submit share one model-id path. Two narrow suffix rewrites:
+
+| Source | Rule |
+|--------|------|
+| OpenCode | `gpt-…-fast` → base model (e.g. `gpt-5.6-sol-fast` → `gpt-5.6-sol`) |
+| Grok | `grok-…-build` → base model (e.g. `grok-4.5-build` → `grok-4.5`) |
+
 ## Leaderboards
 
 ```sh

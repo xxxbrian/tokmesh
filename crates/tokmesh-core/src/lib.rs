@@ -9,6 +9,7 @@ pub mod fs_atomic;
 pub mod mcp;
 mod message_cache;
 pub mod model_alias;
+pub mod model_identity;
 pub mod opencode_model_name;
 mod parser;
 pub mod paths;
@@ -24,6 +25,7 @@ pub use aggregator::*;
 pub use bucket_tz::{bucket_timezone, parse_bucket_timezone, set_bucket_timezone, BucketTimezone};
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
 pub use model_alias::ModelAliasMap;
+pub use model_identity::resolve_model_id;
 pub use parser::*;
 pub use scanner::*;
 pub use sessionize::{
@@ -73,11 +75,19 @@ pub(crate) fn strip_parenthesized_reasoning_tier(model_id: &str) -> Option<&str>
 /// machine-local `modelAliases`.
 ///
 /// Every path that submits, uploads, exports as raw data, or persists a model id
-/// MUST use this, not [`normalize_model_for_grouping`]. A machine-local alias
-/// config must never rewrite the model identity persisted server-side, or usage
-/// history would fragment and fork across a user's devices.
+/// MUST use this (or [`canonical_model_id_for_client`] when the client is
+/// available), not [`normalize_model_for_grouping`]. A machine-local alias config
+/// must never rewrite the model identity persisted server-side, or usage history
+/// would fragment and fork across a user's devices.
 pub fn canonical_model_id(model_id: &str) -> String {
     normalize_syntactic(model_id)
+}
+
+/// Canonical model identity with client-specific suffix resolution applied.
+/// Use this at submit and aggregation boundaries where the client is known;
+/// pricing must continue to use the raw model id stored on `UnifiedMessage`.
+pub fn canonical_model_id_for_client(client: &str, model_id: &str) -> String {
+    canonical_model_id(&model_identity::resolve_model_id(client, model_id))
 }
 
 /// Local display/grouping model name: [`canonical_model_id`] plus the user's
@@ -98,10 +108,11 @@ pub fn normalize_model_for_grouping(model_id: &str) -> String {
 /// provider plus raw model key; all other messages use the normal grouping
 /// name.
 pub fn model_name_for_grouping(client: &str, provider_id: &str, model_id: &str) -> String {
-    let fallback = normalize_model_for_grouping(model_id);
+    let resolved_model_id = model_identity::resolve_model_id(client, model_id);
+    let fallback = normalize_model_for_grouping(&resolved_model_id);
     if client == "opencode" {
         opencode_model_name::global()
-            .display_name(provider_id, model_id)
+            .display_name(provider_id, &resolved_model_id)
             .map(str::to_string)
             .unwrap_or(fallback)
     } else {
@@ -4149,6 +4160,159 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_model_suffixes_resolve_only_at_identity_boundaries() {
+        let fast = UnifiedMessage::new(
+            "opencode",
+            "gpt-5.6-sol-fast",
+            "openai",
+            "s1",
+            1_700_000_000_000,
+            TokenBreakdown::default(),
+            0.0,
+        );
+        assert_eq!(fast.model_id, "gpt-5.6-sol-fast");
+        assert_eq!(
+            super::canonical_model_id_for_client(&fast.client, &fast.model_id),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            super::model_name_for_grouping(&fast.client, &fast.provider_id, &fast.model_id),
+            "gpt-5.6-sol"
+        );
+
+        let build = UnifiedMessage::new(
+            "grok",
+            "grok-4.5-build",
+            "xai",
+            "s1",
+            1_700_000_000_000,
+            TokenBreakdown::default(),
+            0.0,
+        );
+        assert_eq!(build.model_id, "grok-4.5-build");
+        assert_eq!(
+            super::canonical_model_id_for_client(&build.client, &build.model_id),
+            "grok-4.5"
+        );
+        assert_eq!(
+            super::model_name_for_grouping(&build.client, &build.provider_id, &build.model_id),
+            "grok-4.5"
+        );
+        let build_contributions = crate::aggregate_by_date(vec![build]);
+        assert_eq!(build_contributions[0].clients[0].model_id, "grok-4.5");
+
+        // OpenCode sol and sol-fast fold to one model row at grouping time.
+        let base = UnifiedMessage::new(
+            "opencode",
+            "gpt-5.6-sol",
+            "openai",
+            "s1",
+            1_700_000_000_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.1,
+        );
+        let stripped_fast = UnifiedMessage::new(
+            "opencode",
+            "gpt-5.6-sol-fast",
+            "openai",
+            "s1",
+            1_700_000_100_000,
+            TokenBreakdown {
+                input: 20,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.2,
+        );
+        let entries = aggregate_model_usage_entries(vec![base, stripped_fast], &GroupBy::Model);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "gpt-5.6-sol");
+        assert_eq!(entries[0].input, 30);
+        assert_eq!(entries[0].output, 15);
+    }
+
+    #[test]
+    fn test_opencode_fast_fallback_pricing_uses_raw_identity_before_canonical_submit() {
+        let mut litellm = HashMap::new();
+        for model_id in ["gpt-5.6-sol-fast", "openai/gpt-5.6-sol-fast"] {
+            litellm.insert(
+                model_id.to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.01),
+                    output_cost_per_token: Some(0.02),
+                    ..Default::default()
+                },
+            );
+        }
+        for model_id in ["gpt-5.6-sol", "openai/gpt-5.6-sol"] {
+            litellm.insert(
+                model_id.to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    ..Default::default()
+                },
+            );
+        }
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        for (raw_model_id, canonical_model_id) in [
+            ("gpt-5.6-sol-fast", "gpt-5.6-sol"),
+            ("openai/gpt-5.6-sol-fast", "openai/gpt-5.6-sol"),
+        ] {
+            let mut message = UnifiedMessage::new(
+                "opencode",
+                raw_model_id,
+                "openai",
+                "session-1",
+                1_700_000_000_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            );
+
+            assert_eq!(message.model_id, raw_model_id);
+            apply_pricing_if_available(&mut message, Some(&pricing));
+
+            // Fast pricing is 10x the base pricing: this proves lookup saw the
+            // raw suffix rather than the eventual canonical submit identity.
+            assert!((message.cost - 0.2).abs() < 1e-12);
+            assert_eq!(message.cost_source, crate::CostSource::Estimated);
+            assert_eq!(message.model_id, raw_model_id);
+            assert_eq!(
+                super::model_name_for_grouping(
+                    &message.client,
+                    &message.provider_id,
+                    &message.model_id,
+                ),
+                canonical_model_id
+            );
+            assert_eq!(
+                super::canonical_model_id_for_client(&message.client, &message.model_id),
+                canonical_model_id
+            );
+
+            let contributions = crate::aggregate_by_date(vec![message]);
+            assert_eq!(contributions.len(), 1);
+            assert_eq!(contributions[0].clients.len(), 1);
+            assert_eq!(contributions[0].clients[0].model_id, canonical_model_id);
+        }
     }
 
     #[test]

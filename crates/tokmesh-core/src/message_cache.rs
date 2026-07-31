@@ -802,6 +802,10 @@ fn parser_version(client: ClientId) -> u32 {
         // global schema. Their independent counters start from those histories
         // so future changes have an obvious local version to increment.
         ClientId::Codex => 6,
+        // v1->v2: OpenCode gpt-*-fast model ids are canonicalized at grouping
+        // and submit identity boundaries; keep the historical invalidation
+        // monotonic so old v1 entries never become valid again.
+        ClientId::OpenCode => 2,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly.
@@ -2104,6 +2108,11 @@ mod tests {
     #[test]
     fn test_grok_parser_version_invalidates_v2_entries() {
         assert_eq!(parser_version(ClientId::Grok), 3);
+    }
+
+    #[test]
+    fn test_opencode_parser_version_remains_monotonic() {
+        assert_eq!(parser_version(ClientId::OpenCode), 2);
     }
 
     #[test]
