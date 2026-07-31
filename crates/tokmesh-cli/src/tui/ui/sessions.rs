@@ -1,4 +1,4 @@
-use chrono::{Local, NaiveDateTime, TimeZone};
+use chrono::NaiveDateTime;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
@@ -339,7 +339,7 @@ impl SessionColumn {
             }
             Self::LastActive => Cell::from(
                 self.fit(
-                    ms_to_local_naive(s.last_active_ms)
+                    ms_to_bucket_naive(s.last_active_ms)
                         .map(|dt| dt.format(ctx.last_active_fmt).to_string())
                         .unwrap_or_else(|| "\u{2014}".to_string()),
                     ctx,
@@ -802,16 +802,12 @@ fn build_model_cell(models: &[SessionModel], max_cells: usize, app: &App) -> Cel
     Cell::from(Line::from(spans))
 }
 
-/// Convert Unix-ms to a local NaiveDateTime for display.
-fn ms_to_local_naive(ms: i64) -> Option<NaiveDateTime> {
+/// Convert Unix-ms to the pinned bucketing timezone for display.
+fn ms_to_bucket_naive(ms: i64) -> Option<NaiveDateTime> {
     if ms <= 0 {
         return None;
     }
-    let secs = ms / 1000;
-    match Local.timestamp_opt(secs, 0) {
-        chrono::LocalResult::Single(dt) => Some(dt.naive_local()),
-        _ => None,
-    }
+    tokmesh_core::bucket_timezone().naive_datetime_of_ms(ms)
 }
 
 /// Human-readable elapsed time between first and last message in a session.
@@ -1021,7 +1017,7 @@ mod tests {
             // The one value that depends on the machine's time zone, so it is
             // formatted rather than hardcoded. Still catches clipping: the claim
             // is that all sixteen characters survive the layout.
-            SessionColumn::LastActive => ms_to_local_naive(FAT_SESSION_LAST_MS)
+            SessionColumn::LastActive => ms_to_bucket_naive(FAT_SESSION_LAST_MS)
                 .expect("fixture timestamp is in range")
                 .format("%Y-%m-%d %H:%M")
                 .to_string(),

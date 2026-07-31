@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::{Local, TimeZone};
 use colored::Colorize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -1154,11 +1153,12 @@ fn print_daily_breakdown(entries: &[WikiEntry], full: bool) {
 
     let mut by_date: BTreeMap<String, (f64, i64, usize, Vec<&WikiEntry>)> = BTreeMap::new();
     for entry in entries {
-        let date_key = Local
-            .timestamp_millis_opt(entry.created_at)
-            .single()
-            .map(|dt| dt.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let date_key = tokmesh_core::bucket_timezone().date_of_ms(entry.created_at);
+        let date_key = if date_key.is_empty() {
+            "unknown".to_string()
+        } else {
+            date_key
+        };
 
         let agg = by_date.entry(date_key).or_insert((0.0, 0, 0, Vec::new()));
         agg.0 += entry.total_cost;
@@ -1214,9 +1214,8 @@ fn print_session_list(entries: &[WikiEntry], full: bool) {
         println!("  Sessions:");
         println!("  {}", "─".repeat(80));
         for entry in recent {
-            let date = Local
-                .timestamp_millis_opt(entry.created_at)
-                .single()
+            let date = tokmesh_core::bucket_timezone()
+                .naive_datetime_of_ms(entry.created_at)
                 .map(|dt| dt.format("%H:%M").to_string())
                 .unwrap_or_else(|| "??:??".to_string());
 
@@ -1341,58 +1340,24 @@ fn extract_content_for_session(
 }
 
 fn parse_date_range(since: &Option<String>, until: &Option<String>) -> (Option<i64>, Option<i64>) {
-    // The `since`/`until` strings are local-calendar dates (e.g. produced by
-    // `build_date_filter`, which derives them from `chrono::Local::now()`), and
-    // session dates are bucketed in local time (see
-    // `sessions::timestamp_to_date`). Interpret the day boundaries in local time
-    // so filtering lines up with grouping and avoids off-by-a-day mismatches.
+    parse_date_range_with_timezone(since, until, tokmesh_core::bucket_timezone())
+}
+
+fn parse_date_range_with_timezone(
+    since: &Option<String>,
+    until: &Option<String>,
+    timezone: tokmesh_core::BucketTimezone,
+) -> (Option<i64>, Option<i64>) {
     let since_ts = since
         .as_ref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(local_start_of_day_millis);
+        .and_then(|date| timezone.start_of_day_ms(date));
     let until_ts = until
         .as_ref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         .and_then(|d| d.succ_opt())
-        .and_then(|next| local_start_of_day_millis(next).map(|ms| ms - 1));
+        .and_then(|next| timezone.start_of_day_ms(next).map(|ms| ms - 1));
     (since_ts, until_ts)
-}
-
-/// Returns the Unix-millisecond timestamp for the start of `date` in the local
-/// timezone.
-///
-/// This is normally midnight (00:00:00), but in zones that spring forward at
-/// local midnight (e.g. `America/Nuuk` on `2024-03-31`) that wall-clock time
-/// does not exist. Rather than dropping the boundary (which would silently make
-/// date filtering unbounded), we walk forward to the first representable instant
-/// after the gap so the day boundary is preserved.
-fn local_start_of_day_millis(date: chrono::NaiveDate) -> Option<i64> {
-    start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall))
-}
-
-/// Core of [`local_start_of_day_millis`], parameterized over the timezone
-/// resolver so the DST-gap handling can be exercised deterministically in tests.
-///
-/// Starts at midnight and, when that wall-clock time is skipped (a spring-forward
-/// gap), walks forward in 1-minute steps to the first representable instant. The
-/// probe window covers a full day so even unusual offsets resolve rather than
-/// silently dropping the boundary.
-fn start_of_day_millis_with<F>(date: chrono::NaiveDate, resolve: F) -> Option<i64>
-where
-    F: Fn(&chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<Local>>,
-{
-    let mut wall = date.and_hms_opt(0, 0, 0)?;
-    for _ in 0..=(24 * 60) {
-        match resolve(&wall) {
-            chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-                return Some(dt.timestamp_millis());
-            }
-            chrono::LocalResult::None => {
-                wall += chrono::Duration::minutes(1);
-            }
-        }
-    }
-    None
 }
 
 /// Loads the canonical pricing dataset for cost attribution, preferring a fresh
@@ -1519,110 +1484,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_date_range_buckets_in_local_time() {
-        use chrono::{Local, TimeZone};
+    fn parse_date_range_buckets_in_pinned_timezone() {
+        use chrono::{TimeZone, Utc};
 
-        // Pick an arbitrary calendar day. The exact day is irrelevant; what
-        // matters is that `parse_date_range` interprets the boundaries in the
-        // *local* timezone, matching how `sessions::timestamp_to_date` buckets
-        // each message (and how `build_date_filter` derives these strings from
-        // `chrono::Local::now()`).
         let day = "2026-03-08";
-        let (since, until) = parse_date_range(&Some(day.into()), &Some(day.into()));
-
-        let expected_since = Local
-            .with_ymd_and_hms(2026, 3, 8, 0, 0, 0)
+        let timezone = tokmesh_core::parse_bucket_timezone("Pacific/Kiritimati").unwrap();
+        let (since, until) =
+            parse_date_range_with_timezone(&Some(day.into()), &Some(day.into()), timezone);
+        let expected_since = Utc
+            .with_ymd_and_hms(2026, 3, 7, 10, 0, 0)
             .single()
-            .map(|dt| dt.timestamp_millis())
-            .expect("local midnight exists for this fixed date");
-        // The window is inclusive of the whole local day: [00:00:00.000,
-        // next-day 00:00:00.000 - 1ms].
-        let expected_until = Local
-            .with_ymd_and_hms(2026, 3, 9, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let expected_until = Utc
+            .with_ymd_and_hms(2026, 3, 8, 10, 0, 0)
             .single()
-            .map(|dt| dt.timestamp_millis() - 1)
-            .expect("local midnight exists for this fixed date");
+            .unwrap()
+            .timestamp_millis()
+            - 1;
 
         assert_eq!(since, Some(expected_since));
         assert_eq!(until, Some(expected_until));
-
-        // Regression guard: the previous implementation interpreted the day as
-        // UTC. Any machine running in a non-UTC zone would then see boundaries
-        // shifted by the offset. Confirm the local boundary differs from the
-        // UTC one whenever the local offset is non-zero, so this test actually
-        // exercises the fix on offset machines (and stays correct on UTC ones).
-        let utc_since = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis();
-        let local_offset_secs = Local
-            .offset_from_utc_datetime(
-                &chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-            )
-            .local_minus_utc();
-        if local_offset_secs != 0 {
-            assert_ne!(
-                since,
-                Some(utc_since),
-                "local-time bucketing must differ from UTC on offset machines"
-            );
-        } else {
-            assert_eq!(since, Some(utc_since));
-        }
-    }
-
-    #[test]
-    fn start_of_day_preserves_boundary_across_dst_gap() {
-        use chrono::{Local, LocalResult, TimeZone};
-
-        // Simulate a zone that springs forward at local midnight (like
-        // `America/Nuuk` on 2024-03-31, where 00:00–00:59 do not exist). The
-        // resolver maps any wall-clock time before 01:00 to `None` (the gap) and
-        // resolves 01:00+ as a real instant. The first valid instant after the
-        // gap must be returned instead of dropping the boundary.
-        let date = chrono::NaiveDate::from_ymd_opt(2024, 3, 31).unwrap();
-        let resolve = |wall: &chrono::NaiveDateTime| -> LocalResult<chrono::DateTime<Local>> {
-            if wall.time() < chrono::NaiveTime::from_hms_opt(1, 0, 0).unwrap() {
-                LocalResult::None
-            } else {
-                // Resolve against the machine's local zone for an arbitrary but
-                // representable instant; the value just needs to be `Single`.
-                Local.from_local_datetime(wall)
-            }
-        };
-
-        let result = start_of_day_millis_with(date, resolve);
-        let expected = Local
-            .from_local_datetime(&date.and_hms_opt(1, 0, 0).unwrap())
-            .single()
-            .map(|dt| dt.timestamp_millis());
-
-        // Boundary must be preserved (not `None`) and equal to the first valid
-        // post-gap instant (01:00 local).
-        assert!(
-            result.is_some(),
-            "DST-gap midnight must not drop the date boundary (would make filtering unbounded)"
-        );
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn start_of_day_uses_midnight_when_representable() {
-        use chrono::{Local, TimeZone};
-
-        // Sanity: when midnight exists, it is used unchanged (no forward walk).
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
-        let result = start_of_day_millis_with(date, |wall| Local.from_local_datetime(wall));
-        let expected = Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
-            .single()
-            .map(|dt| dt.timestamp_millis());
-        assert_eq!(result, expected);
     }
 
     #[test]

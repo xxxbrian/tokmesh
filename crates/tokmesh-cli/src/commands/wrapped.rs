@@ -1,7 +1,7 @@
-use crate::cursor;
+use crate::{auth, cursor};
 use ab_glyph::{point, Font, FontArc, GlyphId, PxScale, ScaleFont};
 use anyhow::{Context, Result};
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use colored::Colorize;
 use image::{Rgba, RgbaImage};
 use imageproc::drawing::draw_filled_circle_mut;
@@ -159,7 +159,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
     let year = options
         .year
         .clone()
-        .unwrap_or_else(|| Local::now().year().to_string());
+        .unwrap_or_else(|| tokmesh_core::bucket_timezone().today().year().to_string());
     let clients = options.clients.clone().unwrap_or_else(default_clients);
     let local_clients: Vec<String> = clients
         .iter()
@@ -432,7 +432,13 @@ async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> 
 
     let mut y_pos = PADDING + 24 * SCALE;
 
-    let title_text = format!("My Wrapped {}", data.year);
+    let credentials = auth::load_credentials(crate::leaderboard::Leaderboard::Tokscale);
+    let display_username = credentials
+        .as_ref()
+        .and_then(|cred| truncate_username(&cred.username, 30));
+    let title_text = display_username
+        .map(|username| format!("@{}'s Wrapped {}", username, data.year))
+        .unwrap_or_else(|| format!("My Wrapped {}", data.year));
 
     draw_text_mut_baseline(
         &mut canvas,
@@ -691,7 +697,7 @@ fn draw_contribution_graph(
     let year = data
         .year
         .parse::<i32>()
-        .unwrap_or_else(|_| Local::now().year());
+        .unwrap_or_else(|_| tokmesh_core::bucket_timezone().today().year());
     let Some(start_date) = NaiveDate::from_ymd_opt(year, 1, 1) else {
         return;
     };
@@ -1005,7 +1011,10 @@ fn calculate_intensity(cost: f64, max_cost: f64) -> u8 {
 }
 
 fn calculate_streaks(sorted_dates: &[String]) -> (i32, i32) {
-    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let today = tokmesh_core::bucket_timezone()
+        .today()
+        .format("%Y-%m-%d")
+        .to_string();
     calculate_streaks_with_today(sorted_dates, &today)
 }
 
@@ -1450,6 +1459,24 @@ fn capitalize_word(word: &str) -> String {
     result
 }
 
+fn truncate_username(username: &str, max_chars: usize) -> Option<String> {
+    if username.is_empty() {
+        return None;
+    }
+
+    let len = username.chars().count();
+    if len <= max_chars {
+        return Some(username.to_string());
+    }
+
+    if max_chars <= 1 {
+        return Some("\u{2026}".to_string());
+    }
+
+    let truncated = username.chars().take(max_chars - 1).collect::<String>();
+    Some(format!("{}\u{2026}", truncated))
+}
+
 fn default_clients() -> Vec<String> {
     vec![
         "opencode".to_string(),
@@ -1548,6 +1575,37 @@ mod tests {
     #[test]
     fn test_format_number_with_commas_i64_zero() {
         assert_eq!(format_number_with_commas_i64(0), "0");
+    }
+
+    // ========== truncate_username tests ==========
+
+    #[test]
+    fn test_truncate_username_long() {
+        assert_eq!(
+            truncate_username("very_long_username", 10),
+            Some("very_long…".to_string())
+        );
+        assert_eq!(
+            truncate_username("abcdefghijklmnop", 8),
+            Some("abcdefg…".to_string())
+        );
+    }
+
+    #[test]
+    fn test_truncate_username_short() {
+        assert_eq!(truncate_username("short", 10), Some("short".to_string()));
+        assert_eq!(truncate_username("user", 4), Some("user".to_string()));
+    }
+
+    #[test]
+    fn test_truncate_username_empty() {
+        assert_eq!(truncate_username("", 10), None);
+    }
+
+    #[test]
+    fn test_truncate_username_edge_cases() {
+        assert_eq!(truncate_username("a", 1), Some("a".to_string()));
+        assert_eq!(truncate_username("ab", 1), Some("…".to_string()));
     }
 
     // ========== capitalize_word tests ==========

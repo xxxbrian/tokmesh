@@ -1,10 +1,13 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokmesh_core::scanner::ScannerSettings;
+
+use crate::leaderboard::Leaderboard;
 
 use super::themes::ThemeName;
 
@@ -15,6 +18,10 @@ const MAX_AUTO_REFRESH_MS: u64 = 3_600_000;
 const DEFAULT_NATIVE_TIMEOUT_MS: u64 = 300_000;
 const MIN_NATIVE_TIMEOUT_MS: u64 = 5_000;
 const MAX_NATIVE_TIMEOUT_MS: u64 = 3_600_000;
+
+pub const DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES: u64 = 24 * 60;
+pub const MIN_AUTOSUBMIT_INTERVAL_MINUTES: u64 = 15;
+pub const MAX_AUTOSUBMIT_INTERVAL_MINUTES: u64 = 7 * 24 * 60;
 
 #[derive(Debug, Clone, Copy)]
 enum ExplicitHomeConfigLayout {
@@ -40,6 +47,81 @@ pub struct LightSettings {
     /// flags `--write-cache` / `--no-write-cache` override this per-invocation.
     #[serde(default)]
     pub write_cache: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutosubmitSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_autosubmit_interval_minutes")]
+    pub interval_minutes: u64,
+    #[serde(default, deserialize_with = "deserialize_string_array_lossy")]
+    pub clients: Vec<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub year: Option<String>,
+    #[serde(default)]
+    pub today: bool,
+    #[serde(default)]
+    pub yesterday: bool,
+    #[serde(default)]
+    pub week: bool,
+    #[serde(default)]
+    pub month: bool,
+    #[serde(default)]
+    pub scheduler: Option<String>,
+    #[serde(default)]
+    pub managed_executable: Option<String>,
+    /// Version of the build that `managed_executable` was copied from.
+    ///
+    /// The copy is written only by `autosubmit enable`, so upgrading the
+    /// installed binary leaves the scheduled job on the old build. Without this
+    /// there is no way to tell a stale scheduled job from a current one, and
+    /// the drift is silent. `None` on configs written before this field
+    /// existed, and on those the version is reported as unknown rather than
+    /// assumed current.
+    #[serde(default)]
+    pub managed_executable_version: Option<String>,
+    #[serde(default)]
+    pub last_run_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+impl Default for AutosubmitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES,
+            clients: Vec::new(),
+            since: None,
+            until: None,
+            year: None,
+            today: false,
+            yesterday: false,
+            week: false,
+            month: false,
+            scheduler: None,
+            managed_executable: None,
+            managed_executable_version: None,
+            last_run_at_ms: None,
+            last_error: None,
+        }
+    }
+}
+
+impl AutosubmitSettings {
+    fn normalize(mut self) -> Self {
+        self.interval_minutes = self.interval_minutes.clamp(
+            MIN_AUTOSUBMIT_INTERVAL_MINUTES,
+            MAX_AUTOSUBMIT_INTERVAL_MINUTES,
+        );
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +166,12 @@ pub struct Settings {
     /// tab and enable its aggregation in subsequent loads.
     #[serde(default)]
     pub minutely_tab_enabled: bool,
+    #[serde(default)]
+    pub bucket_timezone: Option<String>,
+    #[serde(default)]
+    pub tokscale_autosubmit: AutosubmitSettings,
+    #[serde(default)]
+    pub tokensci_autosubmit: AutosubmitSettings,
     /// User-defined model-name aliases folded at grouping time. Different
     /// name-strings for one physical model (e.g. `claude-opus-4-8-cc`,
     /// `anthropic/claude-opus-4-8`) map to a single canonical name so usage
@@ -127,6 +215,10 @@ fn default_native_timeout_ms() -> u64 {
     DEFAULT_NATIVE_TIMEOUT_MS
 }
 
+fn default_autosubmit_interval_minutes() -> u64 {
+    DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -139,6 +231,9 @@ impl Default for Settings {
             default_clients: Vec::new(),
             light: LightSettings::default(),
             minutely_tab_enabled: false,
+            bucket_timezone: None,
+            tokscale_autosubmit: AutosubmitSettings::default(),
+            tokensci_autosubmit: AutosubmitSettings::default(),
             model_aliases: tokmesh_core::ModelAliasMap::default(),
         }
     }
@@ -181,6 +276,22 @@ pub fn load_default_clients_for_home(home_dir: &Option<String>) -> Vec<String> {
 }
 
 impl Settings {
+    pub fn with_settings_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let dir = crate::paths::get_config_dir().join("autosubmit");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("autosubmit-state.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Could not open settings lock at {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("Could not lock settings at {}", path.display()))?;
+        operation()
+    }
+
     fn normalize(mut self) -> Self {
         self.auto_refresh_ms = self
             .auto_refresh_ms
@@ -188,7 +299,23 @@ impl Settings {
         self.native_timeout_ms = self
             .native_timeout_ms
             .clamp(MIN_NATIVE_TIMEOUT_MS, MAX_NATIVE_TIMEOUT_MS);
+        self.tokscale_autosubmit = self.tokscale_autosubmit.normalize();
+        self.tokensci_autosubmit = self.tokensci_autosubmit.normalize();
         self
+    }
+
+    pub fn autosubmit(&self, board: Leaderboard) -> &AutosubmitSettings {
+        match board {
+            Leaderboard::Tokscale => &self.tokscale_autosubmit,
+            Leaderboard::TokensCi => &self.tokensci_autosubmit,
+        }
+    }
+
+    pub fn autosubmit_mut(&mut self, board: Leaderboard) -> &mut AutosubmitSettings {
+        match board {
+            Leaderboard::Tokscale => &mut self.tokscale_autosubmit,
+            Leaderboard::TokensCi => &mut self.tokensci_autosubmit,
+        }
     }
 
     fn config_path() -> Result<PathBuf> {
@@ -275,6 +402,36 @@ impl Settings {
         write_result
     }
 
+    pub fn save_preserving_autosubmit(&mut self) -> Result<()> {
+        Self::with_settings_lock(|| {
+            let latest = Self::load();
+            self.tokscale_autosubmit = latest.tokscale_autosubmit;
+            self.tokensci_autosubmit = latest.tokensci_autosubmit;
+            self.save()
+        })
+    }
+
+    pub fn load_or_detect_bucket_timezone() -> Result<Option<String>> {
+        Self::with_settings_lock(|| {
+            let path = Self::config_path()?;
+            let mut settings = match fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<Settings>(&content) {
+                    Ok(settings) => settings.normalize(),
+                    Err(_) => return Ok(iana_time_zone::get_timezone().ok()),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+                Err(_) => return Ok(iana_time_zone::get_timezone().ok()),
+            };
+            if settings.bucket_timezone.is_none() {
+                settings.bucket_timezone = iana_time_zone::get_timezone().ok();
+                if settings.bucket_timezone.is_some() {
+                    settings.save()?;
+                }
+            }
+            Ok(settings.bucket_timezone)
+        })
+    }
+
     pub fn theme_name(&self) -> ThemeName {
         self.color_palette.parse().unwrap_or(ThemeName::Blue)
     }
@@ -306,7 +463,31 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn explicit_home_config_path_uses_unix_dot_config_layout() {
@@ -359,6 +540,105 @@ mod tests {
         }"#;
         let parsed: Settings = serde_json::from_str(json).unwrap();
         assert!(parsed.scanner.opencode_db_paths.is_empty());
+    }
+
+    #[test]
+    fn settings_load_backfills_autosubmit_interval_when_missing_from_json() {
+        let json = r#"{
+            "colorPalette": "blue",
+            "autoRefreshEnabled": false,
+            "autoRefreshMs": 60000,
+            "includeUnusedModels": false,
+            "nativeTimeoutMs": 300000
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+
+        assert!(!parsed.tokscale_autosubmit.enabled);
+        assert!(!parsed.tokensci_autosubmit.enabled);
+        assert_eq!(
+            parsed.tokscale_autosubmit.interval_minutes,
+            DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES
+        );
+        assert_eq!(
+            parsed.tokensci_autosubmit.interval_minutes,
+            DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES
+        );
+        assert_eq!(
+            AutosubmitSettings::default().interval_minutes,
+            DEFAULT_AUTOSUBMIT_INTERVAL_MINUTES
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_preserving_autosubmit_keeps_newer_board_state() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKMESH_CONFIG_DIR", temp.path());
+        let mut stale = Settings::default();
+
+        let mut latest = Settings::default();
+        latest.tokscale_autosubmit.enabled = true;
+        latest.tokscale_autosubmit.interval_minutes = 45;
+        latest.tokscale_autosubmit.scheduler = Some("cron".to_string());
+        latest.tokensci_autosubmit.enabled = true;
+        latest.tokensci_autosubmit.interval_minutes = 90;
+        latest.tokensci_autosubmit.last_error = Some("retry pending".to_string());
+        latest.save().unwrap();
+
+        stale.color_palette = "halloween".to_string();
+        stale.save_preserving_autosubmit().unwrap();
+
+        let restored = Settings::load();
+        assert_eq!(restored.color_palette, "halloween");
+        assert!(restored.tokscale_autosubmit.enabled);
+        assert_eq!(restored.tokscale_autosubmit.interval_minutes, 45);
+        assert_eq!(
+            restored.tokscale_autosubmit.scheduler.as_deref(),
+            Some("cron")
+        );
+        assert!(restored.tokensci_autosubmit.enabled);
+        assert_eq!(restored.tokensci_autosubmit.interval_minutes, 90);
+        assert_eq!(
+            restored.tokensci_autosubmit.last_error.as_deref(),
+            Some("retry pending")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn configured_bucket_timezone_is_preserved_by_detection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKMESH_CONFIG_DIR", temp.path());
+        let settings = Settings {
+            bucket_timezone: Some("Pacific/Kiritimati".to_string()),
+            ..Settings::default()
+        };
+        settings.save().unwrap();
+
+        assert_eq!(
+            Settings::load_or_detect_bucket_timezone()
+                .unwrap()
+                .as_deref(),
+            Some("Pacific/Kiritimati")
+        );
+        assert_eq!(
+            Settings::load().bucket_timezone.as_deref(),
+            Some("Pacific/Kiritimati")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn timezone_detection_does_not_overwrite_malformed_settings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKMESH_CONFIG_DIR", temp.path());
+        let path = temp.path().join("settings.json");
+        let malformed = r#"{"colorPalette":"halloween","broken":}"#;
+        fs::write(&path, malformed).unwrap();
+
+        Settings::load_or_detect_bucket_timezone().unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), malformed);
     }
 
     #[test]

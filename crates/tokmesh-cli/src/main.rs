@@ -1,7 +1,10 @@
 mod antigravity;
+mod auth;
 mod claude_diagnostics;
 mod commands;
 mod cursor;
+mod device;
+mod leaderboard;
 mod paths;
 mod trae;
 mod tui;
@@ -95,7 +98,53 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum LeaderboardCommand {
+    #[command(about = "Login (browser device flow, or --token to save an existing API token)")]
+    Login {
+        #[arg(long, help = "Save an existing API token without browser auth")]
+        token: Option<String>,
+    },
+    #[command(about = "Logout and remove stored credentials for this leaderboard")]
+    Logout,
+    #[command(about = "Show the logged-in user for this leaderboard")]
+    Whoami,
+    #[command(about = "Display saved API token as QR code")]
+    Qr {
+        #[arg(long, help = "Skip the interactive confirmation prompt")]
+        yes: bool,
+    },
+    #[command(about = "Submit local usage aggregates to this leaderboard")]
+    Submit {
+        #[command(flatten)]
+        clients: ClientFlags,
+        #[command(flatten)]
+        date: DateRangeFlags,
+        #[arg(long, help = "Print the payload without uploading")]
+        dry_run: bool,
+        #[arg(long, help = "Disable spinner")]
+        no_spinner: bool,
+    },
+    #[command(about = "Manage periodic usage submission to this leaderboard")]
+    Autosubmit {
+        #[command(subcommand)]
+        subcommand: commands::autosubmit::AutosubmitSubcommand,
+    },
+    #[command(about = "Delete all submitted usage data from this leaderboard")]
+    DeleteSubmittedData,
+}
+
+#[derive(Subcommand)]
 enum Commands {
+    #[command(about = "tokscale.ai leaderboard (login, submit, …)")]
+    Tokscale {
+        #[command(subcommand)]
+        command: LeaderboardCommand,
+    },
+    #[command(about = "tokens.ci leaderboard (login, submit, …)")]
+    Tokensci {
+        #[command(subcommand)]
+        command: LeaderboardCommand,
+    },
     #[command(about = "Show model usage report")]
     Models {
         #[arg(long)]
@@ -494,6 +543,11 @@ fn main() -> Result<()> {
     use std::io::IsTerminal;
 
     let cli = Cli::parse();
+    if let Some(name) = tui::settings::Settings::load_or_detect_bucket_timezone()? {
+        if let Some(timezone) = tokmesh_core::parse_bucket_timezone(&name) {
+            tokmesh_core::set_bucket_timezone(timezone);
+        }
+    }
     // Install user-configured model aliases once, before any report/graph/TUI
     // path runs, so model-name variants fold consistently across every command.
     // Honors the global `--home` override exactly like scanner settings; an
@@ -643,6 +697,14 @@ fn main() -> Result<()> {
             run_pricing_lookup(&model_id, json, provider.as_deref(), no_spinner)
         }
         Some(Commands::Clients { json }) => run_clients_command(json, cli.home.clone()),
+        Some(Commands::Tokscale { command }) => {
+            reject_unsupported_home_override(&cli.home, "tokscale")?;
+            run_leaderboard_command(leaderboard::Leaderboard::Tokscale, command, &cli.home)
+        }
+        Some(Commands::Tokensci { command }) => {
+            reject_unsupported_home_override(&cli.home, "tokensci")?;
+            run_leaderboard_command(leaderboard::Leaderboard::TokensCi, command, &cli.home)
+        }
         Some(Commands::Graph {
             output,
             clients,
@@ -690,6 +752,7 @@ fn main() -> Result<()> {
                 None,
             )
         }
+
         Some(Commands::Headless {
             source,
             args,
@@ -746,6 +809,7 @@ fn main() -> Result<()> {
             reject_unsupported_home_override(&cli.home, "warp")?;
             run_warp_command(subcommand)
         }
+
         Some(Commands::TimeMetrics {
             json,
             clients,
@@ -1447,6 +1511,15 @@ fn emit_cursor_sync_warning(
     }
 }
 
+fn default_submit_clients() -> Vec<String> {
+    let mut clients: Vec<String> = tokmesh_core::ClientId::iter()
+        .filter(|client| client.submit_default())
+        .map(|client| client.as_str().to_string())
+        .collect();
+    clients.push("synthetic".to_string());
+    clients
+}
+
 fn reject_unsupported_home_override(home_dir: &Option<String>, command: &str) -> Result<()> {
     if home_dir.is_some() {
         return Err(anyhow::anyhow!(
@@ -1503,7 +1576,7 @@ fn ensure_home_supported_for_tui(home_dir: &Option<String>) -> Result<()> {
 }
 
 fn build_date_filter(date: &DateRangeFlags) -> (Option<String>, Option<String>) {
-    build_date_filter_for_date(date, chrono::Local::now().date_naive())
+    build_date_filter_for_date(date, tokmesh_core::bucket_timezone().today())
 }
 
 fn build_date_filter_for_date(
@@ -1552,7 +1625,7 @@ fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
 }
 
 fn get_date_range_label(date: &DateRangeFlags) -> Option<String> {
-    get_date_range_label_for_date(date, chrono::Local::now().date_naive())
+    get_date_range_label_for_date(date, tokmesh_core::bucket_timezone().today())
 }
 
 fn get_date_range_label_for_date(
@@ -3616,6 +3689,16 @@ fn aggregate_model_report_performance(
     performance
 }
 
+/// Format text as an OSC 8 clickable hyperlink with custom display text.
+/// Falls back to plain display text when stdout is not a terminal.
+fn osc8_link_with_text(url: &str, text: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, text)
+    } else {
+        text.to_string()
+    }
+}
+
 fn dim_borders(table_str: &str) -> String {
     let border_chars: &[char] = &['┌', '─', '┬', '┐', '│', '├', '┼', '┤', '└', '┴', '┘'];
     let mut result = String::with_capacity(table_str.len() * 2);
@@ -4184,6 +4267,14 @@ struct TsExportMeta {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TsSubmitDevice {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TsTimeMetrics {
     total_active_time_ms: i64,
     longest_continuous_ms: i64,
@@ -4195,6 +4286,8 @@ struct TsTimeMetrics {
 #[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
     meta: TsExportMeta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<TsSubmitDevice>,
     summary: TsDataSummary,
     years: Vec<TsYearSummary>,
     contributions: Vec<TsDailyContribution>,
@@ -4204,7 +4297,10 @@ struct TsTokenContributionData {
     mcp_servers: Option<Vec<String>>,
 }
 
-fn to_ts_token_contribution_data(graph: &tokmesh_core::GraphResult) -> TsTokenContributionData {
+fn to_ts_token_contribution_data(
+    graph: &tokmesh_core::GraphResult,
+    device: Option<&device::SubmitDevice>,
+) -> TsTokenContributionData {
     TsTokenContributionData {
         meta: TsExportMeta {
             generated_at: graph.meta.generated_at.clone(),
@@ -4214,6 +4310,10 @@ fn to_ts_token_contribution_data(graph: &tokmesh_core::GraphResult) -> TsTokenCo
                 end: graph.meta.date_range_end.clone(),
             },
         },
+        device: device.map(|d| TsSubmitDevice {
+            id: d.id.clone(),
+            name: d.name.clone(),
+        }),
         summary: TsDataSummary {
             total_tokens: graph.summary.total_tokens,
             total_cost: graph.summary.total_cost,
@@ -4294,6 +4394,182 @@ fn to_ts_token_contribution_data(graph: &tokmesh_core::GraphResult) -> TsTokenCo
                 Some(servers)
             }
         },
+    }
+}
+
+fn run_leaderboard_command(
+    board: leaderboard::Leaderboard,
+    command: LeaderboardCommand,
+    _home: &Option<String>,
+) -> Result<()> {
+    match command {
+        LeaderboardCommand::Login { token } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            match token {
+                Some(token) => rt.block_on(auth::login_with_token(board, &token)),
+                None => rt.block_on(auth::login(board)),
+            }
+        }
+        LeaderboardCommand::Logout => auth::logout(board),
+        LeaderboardCommand::Whoami => auth::whoami(board),
+        LeaderboardCommand::Qr { yes } => auth::show_qr(board, yes),
+        LeaderboardCommand::Submit {
+            clients,
+            date,
+            dry_run,
+            no_spinner: _,
+        } => {
+            let (since, until) = build_date_filter(&date);
+            let year = normalize_year_filter(&date);
+            // Bypass settings.json defaultClients for submit: use submit-specific defaults.
+            let clients = build_client_filter_with_defaults(clients, &[]);
+            run_submit_command(
+                board,
+                clients,
+                since,
+                until,
+                year,
+                dry_run,
+                SubmitMode::Interactive,
+            )
+        }
+        LeaderboardCommand::Autosubmit { subcommand } => run_autosubmit_command(board, subcommand),
+        LeaderboardCommand::DeleteSubmittedData => run_delete_data_command(board),
+    }
+}
+
+fn run_delete_data_command(board: leaderboard::Leaderboard) -> Result<()> {
+    use colored::Colorize;
+    use std::io::{self, Write};
+    use tokio::runtime::Runtime;
+
+    let auth_token = auth::resolve_api_token(board).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Not logged in to {}. Run `tokmesh {} login` or set {}.",
+            board,
+            board.as_str(),
+            board.api_token_env()
+        )
+    })?;
+
+    println!("\n{}", "  ⚠ Delete all submitted usage data".red().bold());
+    println!("{}", "  This will permanently remove:".bright_black());
+    println!("{}", "    • Leaderboard entries".bright_black());
+    println!("{}", "    • Public profile stats".bright_black());
+    println!("{}", "    • Daily usage history".bright_black());
+    println!(
+        "{}",
+        "  Your account and API tokens will stay active.\n".bright_black()
+    );
+
+    print!(
+        "{}",
+        "  Are you sure you want to delete all submitted data? (y/N): ".white()
+    );
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase() != "y" {
+        println!("{}", "  Cancelled.".bright_black());
+        return Ok(());
+    }
+
+    print!(
+        "{}",
+        "  This cannot be undone. You will lose all historical token/cost data. Continue? (y/N): "
+            .white()
+    );
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase() != "y" {
+        println!("{}", "  Cancelled.".bright_black());
+        return Ok(());
+    }
+
+    print!("{}", "  Type \"delete my data\" to confirm: ".white());
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase() != "delete my data" {
+        println!("{}", "  Confirmation failed. Cancelled.".bright_black());
+        return Ok(());
+    }
+
+    println!("\n{}", "  Deleting submitted data...".bright_black());
+
+    let api_url = auth::get_api_base_url(board);
+    let rt = Runtime::new()?;
+
+    let response = rt.block_on(async {
+        reqwest::Client::new()
+            .delete(format!("{}/api/settings/submitted-data", api_url))
+            .header("Authorization", format!("Bearer {}", auth_token.token))
+            .send()
+            .await
+    });
+
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let body: serde_json::Value =
+                rt.block_on(async { resp.json().await }).unwrap_or_default();
+
+            match interpret_delete_submitted_data_response(status, &body)? {
+                DeleteSubmittedDataOutcome::Deleted(count) => {
+                    println!(
+                        "{}",
+                        format!(
+                            "  ✓ Deleted {} submission(s). Leaderboard and profile will refresh shortly.",
+                            count
+                        )
+                        .green()
+                    );
+                }
+                DeleteSubmittedDataOutcome::NotFound => {
+                    println!("{}", "  No submitted data found for this account.".yellow());
+                }
+            }
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Request failed: {}", e));
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeleteSubmittedDataOutcome {
+    Deleted(i64),
+    NotFound,
+}
+
+fn interpret_delete_submitted_data_response(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> Result<DeleteSubmittedDataOutcome> {
+    if status.is_success() {
+        let deleted = body
+            .get("deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let count = body
+            .get("deletedSubmissions")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        if deleted {
+            Ok(DeleteSubmittedDataOutcome::Deleted(count))
+        } else {
+            Ok(DeleteSubmittedDataOutcome::NotFound)
+        }
+    } else {
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown error");
+        Err(anyhow::anyhow!("Failed ({}): {}", status, err))
     }
 }
 
@@ -4460,7 +4736,7 @@ fn run_graph_command(
     emit_cursor_setup_warnings(&cursor_setup_warnings);
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
-    let output_data = to_ts_token_contribution_data(&graph_result);
+    let output_data = to_ts_token_contribution_data(&graph_result, None);
     let json_output = serde_json::to_string_pretty(&output_data)?;
 
     if let Some(output_path) = output {
@@ -4690,7 +4966,7 @@ fn run_import_command(
         return Ok(());
     }
 
-    let mut payload = to_ts_token_contribution_data(graph);
+    let mut payload = to_ts_token_contribution_data(graph, None);
     // The imported data has no MCP provenance of its own — it's derived
     // purely from a third-party clawdboard export. Reusing the graph/submit
     // converter would otherwise embed the *local* machine's configured MCP
@@ -4720,6 +4996,546 @@ fn run_import_command(
     );
 
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct SubmitResponse {
+    #[serde(rename = "submissionId")]
+    submission_id: Option<String>,
+    #[allow(dead_code)]
+    username: Option<String>,
+    metrics: Option<SubmitMetrics>,
+    warnings: Option<Vec<String>>,
+    error: Option<String>,
+    details: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct SubmitMetrics {
+    #[serde(rename = "totalTokens")]
+    total_tokens: Option<i64>,
+    #[serde(rename = "totalCost")]
+    total_cost: Option<f64>,
+    #[serde(rename = "activeDays")]
+    active_days: Option<i32>,
+    #[allow(dead_code)]
+    sources: Option<Vec<String>>,
+}
+
+/// A client row dropped from a submission because it carried cost without any
+/// token attribution. See [`exclude_tokenless_cost_contributions`].
+#[derive(Debug, Clone, PartialEq)]
+struct ExcludedTokenlessRow {
+    date: String,
+    client: String,
+    model_id: String,
+    provider_id: String,
+    cost: f64,
+}
+
+fn client_token_total(tokens: &tokmesh_core::TokenBreakdown) -> i64 {
+    // TokenBreakdown::total() already saturating_adds its fields so a clamped
+    // (i64::MAX) bucket from a corrupt source can't overflow this display fold.
+    tokens.total()
+}
+
+/// Cursor's pre-2025-05 exports include `premium-tool-call` rows billed per
+/// tool invocation with no token attribution. The server grandfathers these
+/// (cost > 0, tokens = 0) rather than rejecting them, so the client must not
+/// drop them either — otherwise that legitimate cost silently disappears from
+/// the submission. Keep in sync with `CURSOR_LEGACY_TOKENLESS_MODELS` in
+/// packages/frontend/src/lib/validation/submission.ts.
+fn is_legacy_tokenless_cursor_row(client: &tokmesh_core::ClientContribution) -> bool {
+    client.client == "cursor"
+        && client.model_id == "premium-tool-call"
+        && client_token_total(&client.tokens) == 0
+}
+
+fn is_aggregate_only_warp_row(client: &tokmesh_core::ClientContribution) -> bool {
+    client.client == "warp"
+        && client.model_id == "aggregate-requests"
+        && client_token_total(&client.tokens) == 0
+}
+
+/// A row the server's "Cost submitted without tokens" sanity check would
+/// reject: real cost with every token bucket at zero, excluding the Cursor
+/// `premium-tool-call` carve-out above.
+fn is_tokenless_costed_row(client: &tokmesh_core::ClientContribution) -> bool {
+    (is_aggregate_only_warp_row(client) || client.cost > 0.0)
+        && client_token_total(&client.tokens) == 0
+        && !is_legacy_tokenless_cursor_row(client)
+}
+
+/// Drop client rows that report cost without any tokens so the submission
+/// passes the server's cost-without-tokens validation instead of being
+/// rejected wholesale.
+///
+/// Cursor's usage export lists historical request/On-Demand charges (e.g.
+/// `auto`, `claude-3.5-sonnet`, `o3`) with empty token columns, and Warp/Oz
+/// only exposes aggregate request/spend counters. The server rejects cost with
+/// no tokens, and request counts must not be submitted as fabricated tokens, so
+/// we exclude the offending rows here and report them to the user.
+///
+/// Excluded rows always carry zero tokens, so only cost/messages change; token
+/// totals, breakdowns, and intensities are untouched. Summary and year rollups
+/// are recomputed from the trimmed contributions.
+fn exclude_tokenless_cost_contributions(
+    graph_result: &mut tokmesh_core::GraphResult,
+) -> Vec<ExcludedTokenlessRow> {
+    let mut excluded: Vec<ExcludedTokenlessRow> = Vec::new();
+
+    for day in graph_result.contributions.iter_mut() {
+        let date = day.date.clone();
+        let mut removed_cost = 0.0;
+        let mut removed_messages: i32 = 0;
+
+        day.clients.retain(|client| {
+            if is_tokenless_costed_row(client) {
+                excluded.push(ExcludedTokenlessRow {
+                    date: date.clone(),
+                    client: client.client.clone(),
+                    model_id: client.model_id.clone(),
+                    provider_id: client.provider_id.clone(),
+                    cost: client.cost,
+                });
+                removed_cost += client.cost;
+                removed_messages = removed_messages.saturating_add(client.messages);
+                false
+            } else {
+                true
+            }
+        });
+
+        if removed_cost > 0.0 || removed_messages > 0 {
+            day.totals.cost = (day.totals.cost - removed_cost).max(0.0);
+            day.totals.messages = day.totals.messages.saturating_sub(removed_messages).max(0);
+        }
+    }
+
+    if !excluded.is_empty() {
+        graph_result.summary = tokmesh_core::calculate_summary(&graph_result.contributions);
+        graph_result.years = tokmesh_core::calculate_years(&graph_result.contributions);
+    }
+
+    excluded
+}
+
+/// Print the rows dropped by [`exclude_tokenless_cost_contributions`] so the
+/// user can see exactly what was left out, capping the per-row detail so a long
+/// history of legacy Cursor charges doesn't flood the terminal.
+fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
+    use colored::Colorize;
+
+    if excluded.is_empty() {
+        return;
+    }
+
+    const MAX_DETAIL_ROWS: usize = 20;
+    let total_cost: f64 = excluded.iter().map(|row| row.cost).sum();
+
+    println!(
+        "{}",
+        format!(
+            "  Excluded {} aggregate/cost-only row(s) with no token data:",
+            excluded.len()
+        )
+        .yellow()
+    );
+
+    for row in excluded.iter().take(MAX_DETAIL_ROWS) {
+        let provider = if row.provider_id.is_empty() {
+            String::new()
+        } else {
+            format!(" (provider={})", row.provider_id)
+        };
+        println!(
+            "{}",
+            format!(
+                "    - {}/{}{} on {}: ${:.4}",
+                row.client, row.model_id, provider, row.date, row.cost
+            )
+            .bright_black()
+        );
+    }
+
+    if excluded.len() > MAX_DETAIL_ROWS {
+        println!(
+            "{}",
+            format!("    ... and {} more", excluded.len() - MAX_DETAIL_ROWS).bright_black()
+        );
+    }
+
+    println!(
+        "{}",
+        format!(
+            "    Excluded {} total; the rest is submitted.",
+            format_currency(total_cost)
+        )
+        .bright_black()
+    );
+    println!();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitMode {
+    Interactive,
+    Autosubmit,
+}
+
+fn run_autosubmit_command(
+    board: leaderboard::Leaderboard,
+    subcommand: commands::autosubmit::AutosubmitSubcommand,
+) -> Result<()> {
+    use commands::autosubmit::{AutosubmitRunDecision, AutosubmitSubcommand};
+
+    match subcommand {
+        AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(board, args),
+        AutosubmitSubcommand::Status { json } => commands::autosubmit::status(board, json),
+        AutosubmitSubcommand::Disable => commands::autosubmit::disable(board),
+        AutosubmitSubcommand::Run { force } => {
+            let Some(_lock) = commands::autosubmit::try_acquire_run_lock(board)? else {
+                println!("Autosubmit is already running.");
+                return Ok(());
+            };
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let (settings, decision) = commands::autosubmit::load_run_config(board, force, now_ms)?;
+            match decision {
+                AutosubmitRunDecision::Disabled => {
+                    println!("Autosubmit is disabled.");
+                    return Ok(());
+                }
+                AutosubmitRunDecision::NotDue { next_run_at_ms } => {
+                    println!(
+                        "Autosubmit is not due yet. Next run: {}.",
+                        commands::autosubmit::format_timestamp_ms(next_run_at_ms)
+                    );
+                    return Ok(());
+                }
+                AutosubmitRunDecision::Due => {}
+            }
+
+            let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
+            match run_submit_command(
+                board,
+                clients,
+                since,
+                until,
+                year,
+                false,
+                SubmitMode::Autosubmit,
+            ) {
+                Ok(()) => {
+                    commands::autosubmit::record_run_success(
+                        board,
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let _ = commands::autosubmit::record_run_error(board, &message);
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+fn run_submit_command(
+    board: leaderboard::Leaderboard,
+    clients: Option<Vec<String>>,
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    dry_run: bool,
+    mode: SubmitMode,
+) -> Result<()> {
+    use colored::Colorize;
+    use tokio::runtime::Runtime;
+    use tokmesh_core::{generate_graph, GroupBy, ReportOptions};
+
+    let auth_token = match auth::resolve_api_token(board) {
+        Some(token) => token,
+        None => {
+            if mode == SubmitMode::Autosubmit {
+                return Err(anyhow::anyhow!(
+                    "Autosubmit requires login to {}. Run `tokmesh {} login` or set {}.",
+                    board,
+                    board.as_str(),
+                    board.api_token_env()
+                ));
+            }
+            eprintln!("\n  {}", format!("Not logged in to {}.", board).yellow());
+            eprintln!(
+                "{}",
+                format!(
+                    "  Run 'tokmesh {} login' or set {}.\n",
+                    board.as_str(),
+                    board.api_token_env()
+                )
+                .bright_black()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    println!("\n  {}\n", format!("Tokmesh → {} — Submit", board).cyan());
+
+    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
+    let explicit_warp_filter = client_filter_explicitly_requests_warp(&clients);
+    let clients = clients.or_else(|| Some(default_submit_clients()));
+
+    let include_cursor = clients
+        .as_ref()
+        .is_none_or(|s| s.iter().any(|src| src == "cursor"));
+    let report_home: Option<String> = None;
+    let has_cursor_cache = has_cursor_usage_cache_for_report(&report_home);
+    if include_cursor && cursor::is_cursor_logged_in() {
+        println!("{}", "  Syncing Cursor usage data...".bright_black());
+        let rt_sync = Runtime::new()?;
+        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache().await });
+        if sync_result.synced {
+            println!(
+                "{}",
+                format!("  Cursor: {} usage events synced", sync_result.rows).bright_black()
+            );
+        } else if let Some(err) = sync_result.error {
+            if has_cursor_cache {
+                println!(
+                    "{}",
+                    format!("  Cursor sync failed; using cached data: {}", err).yellow()
+                );
+            }
+        }
+    }
+    if explicit_cursor_filter || explicit_warp_filter {
+        let cursor_setup_warnings = setup_warnings_for_report(&report_home, &clients);
+        emit_cursor_setup_warnings(&cursor_setup_warnings);
+    }
+
+    println!("{}", "  Scanning local session data...".bright_black());
+
+    let rt = Runtime::new()?;
+    let mut graph_result = rt
+        .block_on(async {
+            generate_graph(ReportOptions {
+                home_dir: None,
+                use_env_roots: true,
+                clients,
+                since,
+                until,
+                year,
+                group_by: GroupBy::default(),
+                scanner_settings: tui::settings::load_scanner_settings(),
+            })
+            .await
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Preserve local-calendar contributions here. The API validator owns the
+    // UTC+ timezone buffer; client-side UTC capping silently drops current-day
+    // usage for users east of UTC.
+    // Drop cost-only rows the server would reject (Cursor historical exports
+    // record per-request cost with empty token columns) and report what was
+    // left out, so a single legacy charge can't block the whole submission.
+    let excluded_rows = exclude_tokenless_cost_contributions(&mut graph_result);
+    report_excluded_tokenless_rows(&excluded_rows);
+
+    println!("{}", "  Data to submit:".white());
+    println!(
+        "{}",
+        format!(
+            "    Date range: {} to {}",
+            graph_result.meta.date_range_start, graph_result.meta.date_range_end,
+        )
+        .bright_black()
+    );
+    println!(
+        "{}",
+        format!("    Active days: {}", graph_result.summary.active_days).bright_black()
+    );
+    println!(
+        "{}",
+        format!(
+            "    Total tokens: {}",
+            format_tokens_with_commas(graph_result.summary.total_tokens)
+        )
+        .bright_black()
+    );
+    println!(
+        "{}",
+        format!(
+            "    Total cost: {}",
+            format_currency(graph_result.summary.total_cost)
+        )
+        .bright_black()
+    );
+    println!(
+        "{}",
+        format!("    Clients: {}", graph_result.summary.clients.join(", ")).bright_black()
+    );
+    println!(
+        "{}",
+        format!("    Models: {} models", graph_result.summary.models.len()).bright_black()
+    );
+    println!();
+
+    if graph_result.summary.total_tokens == 0 {
+        println!("{}", "  No usage data found to submit.\n".yellow());
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("{}", "  Dry run - not submitting data.\n".yellow());
+        return Ok(());
+    }
+
+    println!("{}", "  Submitting to server...".bright_black());
+
+    let api_url = auth::get_api_base_url(board);
+
+    let submit_device = device::resolve_submit_device()?;
+    let submit_payload = to_ts_token_contribution_data(&graph_result, Some(&submit_device));
+
+    let response = rt.block_on(async {
+        reqwest::Client::new()
+            .post(format!("{}/api/submit", api_url))
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", auth_token.token))
+            .json(&submit_payload)
+            .send()
+            .await
+    });
+
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let body: SubmitResponse =
+                rt.block_on(async { resp.json().await })
+                    .unwrap_or_else(|_| SubmitResponse {
+                        submission_id: None,
+                        username: None,
+                        metrics: None,
+                        warnings: None,
+                        error: Some(format!(
+                            "Server returned {} with unparseable response",
+                            status
+                        )),
+                        details: None,
+                    });
+
+            if !status.is_success() {
+                let error = body
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Submission failed".to_string());
+                eprintln!("\n  {}", format!("Error: {}", error).red());
+                if let Some(details) = body.details {
+                    for detail in details {
+                        eprintln!("{}", format!("    - {}", detail).bright_black());
+                    }
+                }
+                println!();
+                if mode == SubmitMode::Autosubmit {
+                    return Err(anyhow::anyhow!(error));
+                }
+                std::process::exit(1);
+            }
+
+            println!("\n  {}", "Successfully submitted!".green());
+            println!();
+            println!("{}", "  Summary:".white());
+            if let Some(id) = body.submission_id {
+                println!("{}", format!("    Submission ID: {}", id).bright_black());
+            }
+            if let Some(metrics) = &body.metrics {
+                if let Some(tokens) = metrics.total_tokens {
+                    println!(
+                        "{}",
+                        format!("    Total tokens: {}", format_tokens_with_commas(tokens))
+                            .bright_black()
+                    );
+                }
+                if let Some(cost) = metrics.total_cost {
+                    println!(
+                        "{}",
+                        format!("    Total cost: {}", format_currency(cost)).bright_black()
+                    );
+                }
+                if let Some(days) = metrics.active_days {
+                    println!("{}", format!("    Active days: {}", days).bright_black());
+                }
+            }
+            if let Some(username) = body
+                .username
+                .clone()
+                .or_else(|| auth_token.username.clone())
+            {
+                println!();
+                println!(
+                    "{}",
+                    osc8_link_with_text(
+                        &format!("{}/u/{}", api_url, username),
+                        &format!("  View your profile: {}/u/{}", api_url, username),
+                    )
+                    .cyan()
+                );
+                println!();
+            }
+
+            if let Some(warnings) = body.warnings {
+                if !warnings.is_empty() {
+                    println!("{}", "  Warnings:".yellow());
+                    for warning in warnings {
+                        println!("{}", format!("    - {}", warning).bright_black());
+                    }
+                    println!();
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("\n  {}", "Error: Failed to connect to server.".red());
+            eprintln!("{}\n", format!("  {}", err).bright_black());
+            if mode == SubmitMode::Autosubmit {
+                return Err(anyhow::anyhow!("Failed to connect to server: {err}"));
+            }
+            std::process::exit(1);
+        }
+    }
+
+    // Warm the TUI cache so the next `tokmesh` launch is instant.
+    // Detached subprocess so submit returns to the shell immediately on large
+    // datasets — a full re-scan would otherwise block for tens of seconds.
+    if mode == SubmitMode::Interactive {
+        spawn_warm_tui_cache_detached();
+    }
+
+    Ok(())
+}
+
+fn spawn_warm_tui_cache_detached() {
+    use std::process::{Command, Stdio};
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("warm-tui-cache")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New process group so the child is not killed by Ctrl-C in the
+        // parent's shell and survives after submit exits.
+        cmd.process_group(0);
+    }
+
+    let _ = cmd.spawn();
 }
 
 /// Resolve the filter set used by a no-`--client`-flag TUI launch.
@@ -5262,6 +6078,11 @@ fn run_headless_command(
 mod tests {
     use super::*;
     use clap::Parser;
+    use reqwest::StatusCode;
+    use tokmesh_core::{
+        calculate_summary, calculate_years, ClientContribution, DailyContribution, DailyTotals,
+        GraphMeta, GraphResult, TokenBreakdown,
+    };
 
     #[test]
     fn test_parse_variant_arg_accepts_known_values() {
@@ -5380,6 +6201,78 @@ mod tests {
         // Must not panic (debug overflow) — the saturating fold caps at i64::MAX.
         let performance = aggregate_model_report_performance(&entries);
         assert_eq!(performance.timed_tokens, 0);
+    }
+
+    #[test]
+    fn client_token_total_saturates_instead_of_overflowing() {
+        let tokens = TokenBreakdown {
+            input: i64::MAX,
+            output: 0,
+            cache_read: i64::MAX,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        assert_eq!(client_token_total(&tokens), i64::MAX);
+    }
+
+    fn token_breakdown(total_tokens: i64) -> TokenBreakdown {
+        TokenBreakdown {
+            input: total_tokens,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }
+    }
+
+    fn daily_contribution(
+        date: &str,
+        total_tokens: i64,
+        total_cost: f64,
+        client: &str,
+        model_id: &str,
+    ) -> DailyContribution {
+        DailyContribution {
+            date: date.to_string(),
+            totals: DailyTotals {
+                tokens: total_tokens,
+                cost: total_cost,
+                messages: 1,
+            },
+            intensity: 0,
+            token_breakdown: token_breakdown(total_tokens),
+            clients: vec![ClientContribution {
+                client: client.to_string(),
+                model_id: model_id.to_string(),
+                provider_id: "openai".to_string(),
+                tokens: token_breakdown(total_tokens),
+                cost: total_cost,
+                messages: 1,
+            }],
+            active_time_ms: None,
+        }
+    }
+
+    fn graph_result_with_contributions(contributions: Vec<DailyContribution>) -> GraphResult {
+        GraphResult {
+            meta: GraphMeta {
+                generated_at: "2026-03-24T00:00:00Z".to_string(),
+                version: "test".to_string(),
+                date_range_start: contributions
+                    .first()
+                    .map(|c| c.date.clone())
+                    .unwrap_or_default(),
+                date_range_end: contributions
+                    .last()
+                    .map(|c| c.date.clone())
+                    .unwrap_or_default(),
+                processing_time_ms: 0,
+            },
+            summary: calculate_summary(&contributions),
+            years: calculate_years(&contributions),
+            contributions,
+            time_metrics: None,
+        }
     }
 
     // Tests below call `build_client_filter_with_defaults` directly with
@@ -5897,6 +6790,14 @@ mod tests {
     }
 
     #[test]
+    fn test_default_submit_clients_excludes_crush() {
+        let clients = default_submit_clients();
+        assert!(clients.contains(&"synthetic".to_string()));
+        assert!(clients.contains(&"zed".to_string()));
+        assert!(!clients.contains(&"crush".to_string()));
+    }
+
+    #[test]
     fn test_build_client_filter_with_defaults_uses_defaults_when_no_flags() {
         let flags = ClientFlags::default();
         let defaults = vec!["opencode".to_string(), "claude".to_string()];
@@ -5956,6 +6857,24 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_submitted_data_command_parses() {
+        let cli = Cli::try_parse_from(["tokmesh", "tokscale", "delete-submitted-data"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokscale {
+                command: LeaderboardCommand::DeleteSubmittedData
+            })
+        ));
+        let cli = Cli::try_parse_from(["tokmesh", "tokensci", "delete-submitted-data"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokensci {
+                command: LeaderboardCommand::DeleteSubmittedData
+            })
+        ));
+    }
+
+    #[test]
     fn test_codex_activity_command_parses() {
         let cli = Cli::try_parse_from(["tokmesh", "codex", "activity", "--json"]).unwrap();
         assert!(matches!(
@@ -5964,6 +6883,113 @@ mod tests {
                 subcommand: CodexSubcommand::Activity { json: true }
             })
         ));
+    }
+
+    #[test]
+    fn test_autosubmit_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "tokmesh",
+            "tokensci",
+            "autosubmit",
+            "enable",
+            "--interval",
+            "2h",
+            "--client",
+            "opencode,claude",
+            "--week",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokensci {
+                command: LeaderboardCommand::Autosubmit {
+                    subcommand: commands::autosubmit::AutosubmitSubcommand::Enable(_),
+                }
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["tokmesh", "tokscale", "autosubmit", "status", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokscale {
+                command: LeaderboardCommand::Autosubmit {
+                    subcommand: commands::autosubmit::AutosubmitSubcommand::Status { json: true },
+                }
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["tokmesh", "tokscale", "autosubmit", "run", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokscale {
+                command: LeaderboardCommand::Autosubmit {
+                    subcommand: commands::autosubmit::AutosubmitSubcommand::Run { force: true },
+                }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tokmesh", "tokensci", "autosubmit", "disable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokensci {
+                command: LeaderboardCommand::Autosubmit {
+                    subcommand: commands::autosubmit::AutosubmitSubcommand::Disable,
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn test_login_token_option_parses() {
+        let cli = Cli::try_parse_from(["tokmesh", "tokscale", "login", "--token", "tt_ci_token"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokscale {
+                command: LeaderboardCommand::Login {
+                    token: Some(token),
+                }
+            }) if token == "tt_ci_token"
+        ));
+
+        let cli = Cli::try_parse_from(["tokmesh", "tokensci", "login", "--token", "tt_ci_token"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tokensci {
+                command: LeaderboardCommand::Login {
+                    token: Some(token),
+                }
+            }) if token == "tt_ci_token"
+        ));
+    }
+
+    #[test]
+    fn test_interpret_delete_submitted_data_response_success() {
+        let body = serde_json::json!({
+            "deleted": true,
+            "deletedSubmissions": 2
+        });
+
+        let outcome = interpret_delete_submitted_data_response(StatusCode::OK, &body).unwrap();
+        match outcome {
+            DeleteSubmittedDataOutcome::Deleted(count) => assert_eq!(count, 2),
+            DeleteSubmittedDataOutcome::NotFound => panic!("expected deleted outcome"),
+        }
+    }
+
+    #[test]
+    fn test_interpret_delete_submitted_data_response_failure() {
+        let body = serde_json::json!({
+            "error": "Not authenticated"
+        });
+
+        let err = interpret_delete_submitted_data_response(StatusCode::UNAUTHORIZED, &body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Failed (401 Unauthorized): Not authenticated"));
     }
 
     #[test]
@@ -6431,6 +7457,172 @@ mod tests {
         assert_eq!(forward1, forward2);
     }
 
+    fn client_contribution(
+        client: &str,
+        model_id: &str,
+        provider_id: &str,
+        total_tokens: i64,
+        cost: f64,
+        messages: i32,
+    ) -> ClientContribution {
+        ClientContribution {
+            client: client.to_string(),
+            model_id: model_id.to_string(),
+            provider_id: provider_id.to_string(),
+            tokens: token_breakdown(total_tokens),
+            cost,
+            messages,
+        }
+    }
+
+    fn day_with_clients(
+        date: &str,
+        token_breakdown_total: i64,
+        clients: Vec<ClientContribution>,
+    ) -> DailyContribution {
+        let tokens: i64 = clients.iter().map(|c| client_token_total(&c.tokens)).sum();
+        let cost: f64 = clients.iter().map(|c| c.cost).sum();
+        let messages: i32 = clients.iter().map(|c| c.messages).sum();
+        DailyContribution {
+            date: date.to_string(),
+            totals: DailyTotals {
+                tokens,
+                cost,
+                messages,
+            },
+            intensity: 0,
+            token_breakdown: token_breakdown(token_breakdown_total),
+            clients,
+            active_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_drops_offenders_and_keeps_the_rest() {
+        // A token-bearing row shares the day with a tokenless cursor charge
+        // (cost, no tokens) and a grandfathered premium-tool-call row.
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2025-05-28",
+            100,
+            vec![
+                client_contribution("cursor", "claude-3.7-sonnet", "anthropic", 100, 0.03, 1),
+                client_contribution("cursor", "auto", "cursor", 0, 0.04, 1),
+                client_contribution("cursor", "premium-tool-call", "cursor", 0, 2.05, 44),
+            ],
+        )]);
+
+        let excluded = exclude_tokenless_cost_contributions(&mut graph);
+
+        // Only the tokenless `auto` row is dropped.
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].model_id, "auto");
+        assert!((excluded[0].cost - 0.04).abs() < 1e-9);
+
+        let day = &graph.contributions[0];
+        assert_eq!(day.clients.len(), 2);
+        assert!(day.clients.iter().all(|c| c.model_id != "auto"));
+        // premium-tool-call is preserved (server carve-out).
+        assert!(day
+            .clients
+            .iter()
+            .any(|c| c.model_id == "premium-tool-call"));
+        // Tokens untouched; cost/messages reduced by the dropped row only.
+        assert_eq!(day.totals.tokens, 100);
+        assert!((day.totals.cost - 2.08).abs() < 1e-9);
+        assert_eq!(day.totals.messages, 45);
+        assert!((graph.summary.total_cost - 2.08).abs() < 1e-9);
+        assert_eq!(graph.summary.total_tokens, 100);
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_zeroes_a_fully_tokenless_day() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2025-05-30",
+            0,
+            vec![
+                client_contribution("cursor", "auto", "cursor", 0, 0.04, 1),
+                client_contribution("cursor", "auto", "cursor", 0, 0.04, 1),
+            ],
+        )]);
+
+        let excluded = exclude_tokenless_cost_contributions(&mut graph);
+
+        assert_eq!(excluded.len(), 2);
+        let day = &graph.contributions[0];
+        assert!(day.clients.is_empty());
+        assert_eq!(day.totals.cost, 0.0);
+        assert_eq!(day.totals.tokens, 0);
+        assert_eq!(graph.summary.total_cost, 0.0);
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_is_noop_without_offenders() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2025-05-28",
+            100,
+            vec![
+                client_contribution("codex", "gpt-5", "openai", 100, 0.03, 1),
+                // Grandfathered cursor legacy row must not be dropped.
+                client_contribution("cursor", "premium-tool-call", "cursor", 0, 2.05, 44),
+            ],
+        )]);
+        let original_cost = graph.summary.total_cost;
+
+        let excluded = exclude_tokenless_cost_contributions(&mut graph);
+
+        assert!(excluded.is_empty());
+        assert_eq!(graph.contributions[0].clients.len(), 2);
+        assert_eq!(graph.summary.total_cost, original_cost);
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_drops_warp_aggregate_requests() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-01-02",
+            0,
+            vec![client_contribution(
+                "warp",
+                "aggregate-requests",
+                "warp",
+                0,
+                12.34,
+                42,
+            )],
+        )]);
+
+        let excluded = exclude_tokenless_cost_contributions(&mut graph);
+
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].client, "warp");
+        assert_eq!(excluded[0].model_id, "aggregate-requests");
+        assert!(graph.contributions[0].clients.is_empty());
+        assert_eq!(graph.summary.total_tokens, 0);
+        assert_eq!(graph.summary.total_cost, 0.0);
+    }
+
+    #[test]
+    fn test_submit_payload_includes_device_when_provided() {
+        let graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-12-31",
+            20,
+            2.50,
+            "codex",
+            "model-b",
+        )]);
+        let device = device::SubmitDevice {
+            id: "dev_test".to_string(),
+            name: Some("Test device".to_string()),
+        };
+
+        let payload = to_ts_token_contribution_data(&graph, Some(&device));
+
+        assert_eq!(payload.device.as_ref().unwrap().id, "dev_test");
+        assert_eq!(
+            payload.device.as_ref().unwrap().name.as_deref(),
+            Some("Test device")
+        );
+    }
+
     #[test]
     fn resolve_cli_write_overrides_settings_false() {
         let settings = tui::settings::Settings {
@@ -6559,6 +7751,12 @@ mod tests {
             ClientFilter::from_client_id(tokmesh_core::ClientId::Grok),
             ClientFilter::Grok
         );
+    }
+
+    #[test]
+    fn default_submit_clients_excludes_warp_aggregate_source() {
+        let clients = default_submit_clients();
+        assert!(!clients.contains(&"warp".to_string()));
     }
 
     #[test]

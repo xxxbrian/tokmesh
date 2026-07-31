@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use tokio::runtime::{Handle, Runtime};
 
 use tokmesh_core::sessions::UnifiedMessage;
@@ -1094,39 +1094,46 @@ fn parse_date(date_str: &str) -> Option<NaiveDate> {
 /// - Spring-forward gap (midnight doesn't exist): fall back to UTC midnight
 ///   rather than silently returning 0 and losing the session boundary.
 fn message_timestamp_ms(msg: &UnifiedMessage) -> i64 {
+    message_timestamp_ms_with_timezone(msg, tokmesh_core::bucket_timezone())
+}
+
+fn message_timestamp_ms_with_timezone(
+    msg: &UnifiedMessage,
+    timezone: tokmesh_core::BucketTimezone,
+) -> i64 {
     if msg.timestamp > 0 {
         return msg.timestamp;
     }
-    use chrono::TimeZone;
     parse_date(&msg.date)
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|dt| match Local.from_local_datetime(&dt) {
-            chrono::LocalResult::Single(local) => local.timestamp_millis(),
-            chrono::LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis(),
-            chrono::LocalResult::None => dt.and_utc().timestamp_millis(),
+        .map(|date| {
+            timezone.start_of_day_ms(date).unwrap_or_else(|| {
+                date.and_hms_opt(0, 0, 0)
+                    .map(|wall| wall.and_utc().timestamp_millis())
+                    .unwrap_or(0)
+            })
         })
         .unwrap_or(0)
 }
 
-/// Convert Unix ms timestamp to a NaiveDateTime truncated to the hour (local tz).
+/// Convert Unix ms timestamp to a NaiveDateTime truncated to the pinned hour.
 fn timestamp_to_hour(timestamp_ms: i64) -> Option<NaiveDateTime> {
-    use chrono::TimeZone;
+    timestamp_to_hour_with_timezone(timestamp_ms, tokmesh_core::bucket_timezone())
+}
+
+fn timestamp_to_hour_with_timezone(
+    timestamp_ms: i64,
+    timezone: tokmesh_core::BucketTimezone,
+) -> Option<NaiveDateTime> {
     if timestamp_ms <= 0 {
         return None;
     }
-    let ts_secs = timestamp_ms / 1000;
-    match Local.timestamp_opt(ts_secs, 0) {
-        chrono::LocalResult::Single(dt) => {
-            let naive = dt.naive_local();
-            Some(
-                naive
-                    .date()
-                    .and_hms_opt(naive.hour(), 0, 0)
-                    .unwrap_or(naive),
-            )
-        }
-        _ => None,
-    }
+    let naive = timezone.naive_datetime_of_ms(timestamp_ms)?;
+    Some(
+        naive
+            .date()
+            .and_hms_opt(naive.hour(), 0, 0)
+            .unwrap_or(naive),
+    )
 }
 
 /// Derive an hour-truncated NaiveDateTime from `msg.timestamp` when present,
@@ -1140,25 +1147,25 @@ fn hour_bucket_with_fallback(timestamp_ms: i64, date_str: &str) -> Option<NaiveD
     parse_date(date_str).and_then(|d| d.and_hms_opt(0, 0, 0))
 }
 
-/// Convert Unix ms timestamp to a NaiveDateTime truncated to the minute (local tz).
+/// Convert Unix ms timestamp to a NaiveDateTime truncated to the pinned minute.
 fn timestamp_to_minute(timestamp_ms: i64) -> Option<NaiveDateTime> {
-    use chrono::TimeZone;
+    timestamp_to_minute_with_timezone(timestamp_ms, tokmesh_core::bucket_timezone())
+}
+
+fn timestamp_to_minute_with_timezone(
+    timestamp_ms: i64,
+    timezone: tokmesh_core::BucketTimezone,
+) -> Option<NaiveDateTime> {
     if timestamp_ms <= 0 {
         return None;
     }
-    let ts_secs = timestamp_ms / 1000;
-    match Local.timestamp_opt(ts_secs, 0) {
-        chrono::LocalResult::Single(dt) => {
-            let naive = dt.naive_local();
-            Some(
-                naive
-                    .date()
-                    .and_hms_opt(naive.hour(), naive.minute(), 0)
-                    .unwrap_or(naive),
-            )
-        }
-        _ => None,
-    }
+    let naive = timezone.naive_datetime_of_ms(timestamp_ms)?;
+    Some(
+        naive
+            .date()
+            .and_hms_opt(naive.hour(), naive.minute(), 0)
+            .unwrap_or(naive),
+    )
 }
 
 /// Derive a minute-truncated NaiveDateTime from `msg.timestamp` when present,
@@ -1172,7 +1179,7 @@ fn minute_bucket_with_fallback(timestamp_ms: i64, date_str: &str) -> Option<Naiv
 }
 
 fn build_contribution_graph(daily: &[DailyUsage]) -> GraphData {
-    build_contribution_graph_for_today(daily, Local::now().date_naive())
+    build_contribution_graph_for_today(daily, tokmesh_core::bucket_timezone().today())
 }
 
 fn build_contribution_graph_for_today(daily: &[DailyUsage], today: NaiveDate) -> GraphData {
@@ -1233,7 +1240,7 @@ fn build_contribution_graph_for_today(daily: &[DailyUsage], today: NaiveDate) ->
 }
 
 fn calculate_streaks(daily: &[DailyUsage]) -> (u32, u32) {
-    calculate_streaks_for_today(daily, Local::now().date_naive())
+    calculate_streaks_for_today(daily, tokmesh_core::bucket_timezone().today())
 }
 
 pub fn aggregate_monthly_from_daily(daily: &[DailyUsage]) -> Vec<MonthlyUsage> {
@@ -1440,6 +1447,58 @@ mod tests {
             reasoning: 0,
         };
         assert_eq!(positive_unified_token_total(&tokens), i64::MAX);
+    }
+
+    #[test]
+    fn hourly_and_minutely_buckets_use_pinned_timezone() {
+        use chrono::{TimeZone, Utc};
+
+        let timezone = tokmesh_core::parse_bucket_timezone("Pacific/Kiritimati").unwrap();
+        let timestamp = Utc
+            .with_ymd_and_hms(2026, 7, 31, 12, 34, 56)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            timestamp_to_hour_with_timezone(timestamp, timezone)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            "2026-08-01 02:00"
+        );
+        assert_eq!(
+            timestamp_to_minute_with_timezone(timestamp, timezone)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            "2026-08-01 02:34"
+        );
+    }
+
+    #[test]
+    fn missing_timestamp_uses_pinned_date_midnight() {
+        use chrono::{TimeZone, Utc};
+
+        let timezone = tokmesh_core::parse_bucket_timezone("Pacific/Kiritimati").unwrap();
+        let mut message = UnifiedMessage::new(
+            "opencode",
+            "gpt-4o",
+            "openai",
+            "session",
+            0,
+            CoreTokenBreakdown::default(),
+            0.0,
+        );
+        message.date = "2026-08-01".to_string();
+
+        assert_eq!(
+            message_timestamp_ms_with_timezone(&message, timezone),
+            Utc.with_ymd_and_hms(2026, 7, 31, 10, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        );
     }
 
     fn test_pricing_service() -> PricingService {

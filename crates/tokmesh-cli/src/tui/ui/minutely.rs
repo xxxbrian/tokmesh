@@ -1,4 +1,4 @@
-use chrono::{Local, Timelike};
+use chrono::Timelike;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
@@ -51,7 +51,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let metric_cache_write_style = app.theme.metric_cache_write_style();
     let current_row_style = app.theme.current_row_style();
     let striped_row_style = app.theme.striped_row_style();
-    let now = Local::now().naive_local();
+    let now = tokmesh_core::bucket_timezone().now_naive();
     let current_minute = now
         .date()
         .and_hms_opt(now.hour(), now.minute(), 0)
