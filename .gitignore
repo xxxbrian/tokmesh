@@ -33,7 +33,6 @@ crates/tokmesh-cli/*-export-*.json
 crates/tokmesh/tokmesh-export-*.json
 crates/tokmesh/*-export-*.json
 
-# npm staged native binaries (CI injects from GitHub Releases)
-packaging/npm/**/tokmesh
-packaging/npm/**/tokmesh.exe
+# npm install artifacts (downloaded binary lives under vendor/)
+packaging/npm/**/vendor/
 packaging/npm/**/*.tgz
