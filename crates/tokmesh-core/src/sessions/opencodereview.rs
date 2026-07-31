@@ -24,7 +24,7 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
 
-    for line in BufReader::new(file).lines() {
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let Ok(line) = line else { continue };
 
         if !line.contains("llm_response") && !line.contains("session_start") {
@@ -86,8 +86,8 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
         // `duration_ms` is that call's elapsed time, so sessionize()'s
         // `[timestamp, timestamp + duration_ms]` span would otherwise
         // project forward past the actual completion into phantom idle time.
-        // Back-calculate the start anchor the same way #890 did for
-        // Copilot's `endTime`-only records.
+        // Back-calculate the start anchor the same way used for Copilot's
+        // `endTime`-only records.
         //
         // Only do this when `explicit_timestamp` is a real recorded end
         // timestamp: when it's absent, `recorded_timestamp` is
@@ -99,8 +99,15 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             _ => recorded_timestamp,
         };
 
+        // Timestamped duplicate rows are replayed writes of the same call and
+        // retain the historical key. Timestampless rows all share file mtime,
+        // so use their stable file line to keep distinct calls distinct.
+        let line_discriminator = match explicit_timestamp {
+            Some(_) => String::new(),
+            None => format!(":line{line_index}"),
+        };
         let dedup_key = format!(
-            "opencodereview:{session_id}:{recorded_timestamp}:{model_id}:{}:{}:{}:{}",
+            "opencodereview:{session_id}:{recorded_timestamp}:{model_id}:{}:{}:{}:{}{line_discriminator}",
             tokens.input, tokens.output, tokens.cache_read, tokens.cache_write,
         );
         if !seen.insert(dedup_key.clone()) {
@@ -197,6 +204,17 @@ mod tests {
         )
     }
 
+    fn llm_response_without_timestamp(
+        model: &str,
+        duration_ms: i64,
+        prompt: i64,
+        completion: i64,
+    ) -> String {
+        format!(
+            r#"{{"type":"llm_response","sessionId":"test-session-123","model":"{model}","duration_ms":{duration_ms},"usage":{{"prompt_tokens":{prompt},"completion_tokens":{completion},"cache_read_tokens":0,"cache_write_tokens":0}}}}"#
+        )
+    }
+
     #[test]
     fn parses_single_llm_response() {
         let content = format!(
@@ -285,6 +303,50 @@ mod tests {
     }
 
     #[test]
+    fn timestampless_records_with_identical_usage_stay_distinct() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            session_start("/home/user/project"),
+            llm_response_without_timestamp("gpt-4o", 1200, 100, 50),
+            llm_response_without_timestamp("gpt-4o", 3400, 100, 50),
+        );
+        let msgs = parse_events(&content);
+
+        assert_eq!(msgs.len(), 2);
+        assert_ne!(msgs[0].dedup_key, msgs[1].dedup_key);
+        assert_eq!(msgs[0].duration_ms, Some(1200));
+        assert_eq!(msgs[1].duration_ms, Some(3400));
+    }
+
+    #[test]
+    fn reparsing_timestampless_records_reproduces_dedup_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test-session-123.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                session_start("/home/user/project"),
+                llm_response_without_timestamp("gpt-4o", 1200, 100, 50),
+                llm_response_without_timestamp("gpt-4o", 3400, 100, 50),
+            ),
+        )
+        .unwrap();
+
+        let parse_keys = || {
+            parse_opencodereview_file(&path)
+                .into_iter()
+                .map(|msg| msg.dedup_key)
+                .collect::<Vec<_>>()
+        };
+        let first = parse_keys();
+        let second = parse_keys();
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn skips_zero_token_records() {
         let content = format!(
             "{}\n{}\n",
@@ -334,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_llm_response_timestamp_is_start_anchored() {
-        // Regression (follow-up to #890): an `llm_response` record's
+        // An `llm_response` record's
         // `timestamp` is written when the response is logged, i.e. the
         // call's *end*, not its start. `duration_ms` is that call's elapsed
         // time, so sessionize()'s `[timestamp, timestamp + duration_ms]`

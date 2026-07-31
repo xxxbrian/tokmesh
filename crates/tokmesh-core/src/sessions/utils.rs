@@ -8,7 +8,7 @@ use std::time::SystemTime;
 pub(crate) fn extract_i64(value: Option<&Value>) -> Option<i64> {
     value.and_then(|val| {
         val.as_i64()
-            .or_else(|| val.as_u64().map(|v| v as i64))
+            .or_else(|| val.as_u64().map(|v| i64::try_from(v).unwrap_or(i64::MAX)))
             .or_else(|| val.as_str().and_then(|s| s.parse::<i64>().ok()))
     })
 }
@@ -24,7 +24,7 @@ pub(crate) fn parse_timestamp_value(value: &Value) -> Option<i64> {
 
     let numeric = value
         .as_i64()
-        .or_else(|| value.as_u64().map(|v| v as i64))?;
+        .or_else(|| value.as_u64().map(|v| i64::try_from(v).unwrap_or(i64::MAX)))?;
     if numeric <= 0 {
         return None;
     }

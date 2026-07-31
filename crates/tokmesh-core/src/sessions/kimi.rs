@@ -244,7 +244,13 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             .or_else(|| latest_request_model.clone())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        let timestamp_ms = wire_line.time.unwrap_or(fallback_timestamp);
+        // `time` is Unix milliseconds, so only positivity is checked here.
+        // Rescaling a corrupt small value as seconds would invent a plausible
+        // timestamp; the file mtime is the honest fallback.
+        let timestamp_ms = wire_line
+            .time
+            .filter(|ms| *ms > 0)
+            .unwrap_or(fallback_timestamp);
 
         messages.push(UnifiedMessage::new(
             "kimi",
@@ -269,9 +275,11 @@ pub fn parse_kimi_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let model = read_model_from_config(path);
     let session_id = extract_session_id(path);
+    let fallback_timestamp = file_modified_timestamp_ms(path);
 
     let reader = BufReader::new(file);
     let mut messages: Vec<UnifiedMessage> = Vec::new();
+    let mut timestamp_sources: Vec<TimestampSource> = Vec::new();
     let mut keyed_indices: HashMap<String, usize> = HashMap::new();
 
     for line in reader.lines() {
@@ -316,11 +324,16 @@ pub fn parse_kimi_file(path: &Path) -> Vec<UnifiedMessage> {
             None => continue,
         };
 
-        // Convert Unix seconds (float) to milliseconds, fallback to file mtime
-        let timestamp_ms = wire_line
+        // Convert Unix seconds to milliseconds, falling back to file mtime for
+        // missing or non-positive wire values.
+        let (timestamp_ms, timestamp_source) = match wire_line
             .timestamp
             .map(|ts| (ts * 1000.0) as i64)
-            .unwrap_or_else(|| file_modified_timestamp_ms(path));
+            .filter(|ms| *ms > 0)
+        {
+            Some(ms) => (ms, TimestampSource::Wire),
+            None => (fallback_timestamp, TimestampSource::FileMtime),
+        };
 
         // Skip entries with zero tokens
         let Some(tokens) = token_usage.to_breakdown() else {
@@ -339,7 +352,13 @@ pub fn parse_kimi_file(path: &Path) -> Vec<UnifiedMessage> {
             0.0,
             dedup_key,
         );
-        push_or_replace_status_update(&mut messages, &mut keyed_indices, message);
+        push_or_replace_status_update(
+            &mut messages,
+            &mut timestamp_sources,
+            &mut keyed_indices,
+            message,
+            timestamp_source,
+        );
     }
 
     messages
@@ -353,18 +372,40 @@ fn exact_token_total(tokens: &TokenBreakdown) -> i128 {
         + i128::from(tokens.reasoning)
 }
 
-fn should_replace_status_update(existing: &UnifiedMessage, candidate: &UnifiedMessage) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimestampSource {
+    Wire,
+    FileMtime,
+}
+
+fn should_replace_status_update(
+    existing: (&UnifiedMessage, TimestampSource),
+    candidate: (&UnifiedMessage, TimestampSource),
+) -> bool {
+    let (existing, existing_source) = existing;
+    let (candidate, candidate_source) = candidate;
     let existing_total = exact_token_total(&existing.tokens);
     let candidate_total = exact_token_total(&candidate.tokens);
 
-    candidate_total > existing_total
-        || (candidate_total == existing_total && candidate.timestamp >= existing.timestamp)
+    if candidate_total != existing_total {
+        return candidate_total > existing_total;
+    }
+
+    // File mtime is only a fallback and must not outrank a real wire anchor
+    // merely because it is newer than every record in the file.
+    if existing_source != candidate_source {
+        return candidate_source == TimestampSource::Wire;
+    }
+
+    candidate.timestamp >= existing.timestamp
 }
 
 fn push_or_replace_status_update(
     messages: &mut Vec<UnifiedMessage>,
+    timestamp_sources: &mut Vec<TimestampSource>,
     keyed_indices: &mut HashMap<String, usize>,
     message: UnifiedMessage,
+    timestamp_source: TimestampSource,
 ) {
     let dedup_key = message
         .dedup_key
@@ -374,18 +415,24 @@ fn push_or_replace_status_update(
 
     let Some(dedup_key) = dedup_key else {
         messages.push(message);
+        timestamp_sources.push(timestamp_source);
         return;
     };
 
     if let Some(index) = keyed_indices.get(&dedup_key).copied() {
-        if should_replace_status_update(&messages[index], &message) {
+        if should_replace_status_update(
+            (&messages[index], timestamp_sources[index]),
+            (&message, timestamp_source),
+        ) {
             messages[index] = message;
+            timestamp_sources[index] = timestamp_source;
         }
         return;
     }
 
     let index = messages.len();
     messages.push(message);
+    timestamp_sources.push(timestamp_source);
     keyed_indices.insert(dedup_key, index);
 }
 
@@ -588,6 +635,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_kimi_non_positive_timestamps_fall_back_to_mtime() {
+        let content = r#"{"type": "metadata", "protocol_version": "1.3"}
+{"timestamp": -1.5, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 10, "output": 1, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-negative"}}}
+{"timestamp": 0, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 20, "output": 2, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-zero"}}}
+{"timestamp": 1770983426.420942, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 30, "output": 3, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-valid"}}}"#;
+        let file = create_test_file(content);
+        let mtime = file_modified_timestamp_ms(file.path());
+
+        let messages = parse_kimi_file(file.path());
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].timestamp, mtime);
+        assert_eq!(messages[1].tokens.input, 20);
+        assert_eq!(messages[1].timestamp, mtime);
+        assert_eq!(messages[2].tokens.input, 30);
+        assert_eq!(messages[2].timestamp, 1770983426420);
+    }
+
+    #[test]
+    fn test_parse_kimi_wire_timestamp_wins_tied_dedup_in_both_orders() {
+        for content in [
+            r#"{"type": "metadata", "protocol_version": "1.3"}
+{"timestamp": 1770983426.420942, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}
+{"timestamp": -1, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}"#,
+            r#"{"type": "metadata", "protocol_version": "1.3"}
+{"timestamp": -1, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}
+{"timestamp": 1770983426.420942, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}"#,
+        ] {
+            let file = create_test_file(content);
+            let messages = parse_kimi_file(file.path());
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].timestamp, 1770983426420);
+        }
+    }
+
+    #[test]
     fn test_parse_kimi_malformed_lines() {
         let content = r#"{"type": "metadata", "protocol_version": "1.3"}
 not valid json at all
@@ -705,6 +790,25 @@ not valid json at all
     }
 
     #[test]
+    fn test_parse_kimi_code_non_positive_time_falls_back_to_mtime() {
+        let content = r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":10,"output":1,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":-1500}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":20,"output":2,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":0}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":30,"output":3,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319377014}"#;
+        let (_dir, fake_path) = create_kimi_code_test_file(content);
+        let mtime = file_modified_timestamp_ms(&fake_path);
+
+        let messages = parse_kimi_code_file(&fake_path);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].timestamp, mtime);
+        assert_eq!(messages[1].tokens.input, 20);
+        assert_eq!(messages[1].timestamp, mtime);
+        assert_eq!(messages[2].tokens.input, 30);
+        assert_eq!(messages[2].timestamp, 1780319377014);
+    }
+
+    #[test]
     fn test_normalize_kimi_code_model() {
         assert_eq!(
             normalize_kimi_code_model("kimi-code/kimi-for-coding"),
@@ -795,5 +899,7 @@ not valid json at all
             "/home/user/.kimi/sessions/group/uuid/wire.jsonl"
         )));
         assert!(!is_kimi_code_path(std::path::Path::new("wire.jsonl")));
+        assert!(!is_kimi_code_path(std::path::Path::new("")));
+        assert_eq!(kimi_config_path(std::path::Path::new("")), None);
     }
 }

@@ -1370,6 +1370,26 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let opencodereview_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::OpenCodeReview)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCodeReview),
+                path,
+                &source_cache,
+                pricing,
+                sessions::opencodereview::parse_opencodereview_file,
+            )
+        })
+        .collect();
+    for outcome in opencodereview_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let jcode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Jcode)
         .par_iter()

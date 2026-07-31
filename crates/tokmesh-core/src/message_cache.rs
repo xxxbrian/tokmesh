@@ -847,7 +847,7 @@ fn parser_version(client: ClientId) -> u32 {
         // opencodereview's llm_response timestamp is now back-calculated to
         // the call start (timestamp - duration_ms) instead of the recorded
         // (end-anchored) timestamp.
-        ClientId::OpenCodeReview => 2,
+        ClientId::OpenCodeReview => 3,
         // v2->v3: turn_completed model usage now excludes reasoning from raw
         // output, completed legacy fallback turns are retained, and signals
         // reconciliation stays anchored to the earliest session activity.
@@ -860,7 +860,7 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Kiro => 2,
         // Kimi v2 checks token buckets without an overflowing sum. v2->v3:
         // symbolic usage-record models now resolve from the latest llm.request.
-        ClientId::Kimi => 3,
+        ClientId::Kimi => 4,
         // v1->v2: per-model token attribution now comes from
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
@@ -2092,13 +2092,13 @@ mod tests {
         assert_eq!(parser_version(ClientId::Jcode), 7);
         assert_eq!(parser_version(ClientId::DevinCli), 3);
         assert_eq!(parser_version(ClientId::Zcode), 3);
-        assert_eq!(parser_version(ClientId::OpenCodeReview), 2);
+        assert_eq!(parser_version(ClientId::OpenCodeReview), 3);
         assert_eq!(parser_version(ClientId::Kiro), 2);
     }
 
     #[test]
     fn test_kimi_parser_version_invalidates_v2_entries() {
-        assert_eq!(parser_version(ClientId::Kimi), 3);
+        assert_eq!(parser_version(ClientId::Kimi), 4);
     }
 
     #[test]

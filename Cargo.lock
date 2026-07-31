@@ -3517,7 +3517,6 @@ dependencies = [
  "chrono-tz",
  "dirs",
  "fs2",
- "iana-time-zone",
  "libc",
  "once_cell",
  "rayon",
