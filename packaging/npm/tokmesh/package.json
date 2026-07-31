@@ -1,0 +1,41 @@
+{
+  "name": "tokmesh",
+  "version": "0.1.0",
+  "description": "Local AI coding token analytics CLI and TUI",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xxxbrian/tokmesh.git"
+  },
+  "homepage": "https://github.com/xxxbrian/tokmesh",
+  "license": "MIT",
+  "bin": {
+    "tokmesh": "bin/tokmesh.js"
+  },
+  "files": [
+    "bin/",
+    "package.json",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "tokmesh-linux-x64": "0.1.0",
+    "tokmesh-linux-arm64": "0.1.0",
+    "tokmesh-darwin-x64": "0.1.0",
+    "tokmesh-darwin-arm64": "0.1.0",
+    "tokmesh-windows-x64": "0.1.0",
+    "tokmesh-windows-arm64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "tokmesh",
+    "tokens",
+    "cli",
+    "tui",
+    "ai",
+    "usage"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

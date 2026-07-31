@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bump the unified workspace version used by all tokmesh crates.
+"""Bump the unified workspace version used by all tokmesh distribution channels.
 
 Usage:
   scripts/bump-version.py 0.2.0
@@ -8,8 +8,8 @@ Usage:
 Updates:
   - [workspace.package] version in root Cargo.toml
   - version fields on internal path deps (tokmesh-core / tokmesh-cli)
-  - packaging/npm/**/package.json version (+ @tokmesh/* pins) if present
-  - packaging/pypi/pyproject.toml version if present
+  - packaging/npm/**/package.json (version + tokmesh-* optionalDependency pins)
+  - packaging/pypi/pyproject.toml and src/tokmesh/__init__.py
 
 Does not create git commits or tags. Review the diff, commit, then tag vX.Y.Z.
 """
@@ -17,9 +17,9 @@ Does not create git commits or tags. Review the diff, commit, then tag vX.Y.Z.
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
-import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -61,39 +61,47 @@ def patch_npm(version: str) -> list[str]:
     if not npm_root.is_dir():
         return changed
     for path in sorted(npm_root.rglob("package.json")):
-        text = path.read_text()
-        new = re.sub(
-            r'("version"\s*:\s*")([^"]+)(")',
-            rf"\g<1>{version}\g<3>",
-            text,
-            count=1,
-        )
-        new = re.sub(
-            r'("@tokmesh/[^"]+"\s*:\s*")(\d+\.\d+\.\d+[0-9A-Za-z\.-]*)(")',
-            rf"\g<1>{version}\g<3>",
-            new,
-        )
-        if new != text:
-            path.write_text(new)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        before = json.dumps(data, sort_keys=True)
+        data["version"] = version
+        opts = data.get("optionalDependencies")
+        if isinstance(opts, dict):
+            for k in list(opts):
+                if k == "tokmesh" or k.startswith("tokmesh-"):
+                    opts[k] = version
+        after = json.dumps(data, sort_keys=True)
+        if after != before:
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
             changed.append(str(path.relative_to(ROOT)))
     return changed
 
 
 def patch_pypi(version: str) -> list[str]:
     changed: list[str] = []
-    path = ROOT / "packaging" / "pypi" / "pyproject.toml"
-    if not path.is_file():
-        return changed
-    text = path.read_text()
-    updated, n = re.subn(
-        r'(?m)^(version\s*=\s*")([^"]+)(")',
-        rf"\g<1>{version}\g<3>",
-        text,
-        count=1,
-    )
-    if n == 1 and updated != text:
-        path.write_text(updated)
-        changed.append(str(path.relative_to(ROOT)))
+    pyproject = ROOT / "packaging" / "pypi" / "pyproject.toml"
+    if pyproject.is_file():
+        text = pyproject.read_text(encoding="utf-8")
+        updated, n = re.subn(
+            r'(?m)^(version\s*=\s*")([^"]+)(")',
+            rf"\g<1>{version}\g<3>",
+            text,
+            count=1,
+        )
+        if n == 1 and updated != text:
+            pyproject.write_text(updated, encoding="utf-8")
+            changed.append(str(pyproject.relative_to(ROOT)))
+    init = ROOT / "packaging" / "pypi" / "src" / "tokmesh" / "__init__.py"
+    if init.is_file():
+        text = init.read_text(encoding="utf-8")
+        updated, n = re.subn(
+            r'(__version__\s*=\s*")([^"]+)(")',
+            rf"\g<1>{version}\g<3>",
+            text,
+            count=1,
+        )
+        if n == 1 and updated != text:
+            init.write_text(updated, encoding="utf-8")
+            changed.append(str(init.relative_to(ROOT)))
     return changed
 
 
@@ -104,10 +112,10 @@ def main() -> None:
     version = normalize(args.version)
 
     cargo = ROOT / "Cargo.toml"
-    text = cargo.read_text()
+    text = cargo.read_text(encoding="utf-8")
     text = patch_workspace_package_version(text, version)
     text = patch_internal_dep_versions(text, version)
-    cargo.write_text(text)
+    cargo.write_text(text, encoding="utf-8")
 
     changed = ["Cargo.toml", *patch_npm(version), *patch_pypi(version)]
     print(f"workspace version -> {version}")

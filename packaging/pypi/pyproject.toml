@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokmesh"
+version = "0.1.0"
+description = "Local AI coding token analytics CLI and TUI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Tokmesh contributors" }]
+keywords = ["tokmesh", "tokens", "cli", "tui", "ai", "usage"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Utilities",
+]
+# Runtime: pure launcher; native binary is shipped inside platform wheels.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/xxxbrian/tokmesh"
+Repository = "https://github.com/xxxbrian/tokmesh"
+Releases = "https://github.com/xxxbrian/tokmesh/releases"
+
+[project.scripts]
+tokmesh = "tokmesh._cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

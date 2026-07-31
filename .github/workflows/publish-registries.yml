@@ -9,12 +9,13 @@
 # Typical flow:
 #   scripts/bump-version.py X.Y.Z → commit → tag vX.Y.Z → push →
 #   wait for Release (binaries) → Actions → Publish registries →
-#   version=X.Y.Z, dry_run=false, crates=true
+#   version=X.Y.Z, dry_run=false, select crates/npm/pypi
 #
-# Secrets (add when ready):
-#   CARGO_REGISTRY_TOKEN  — crates.io API token (publish scope)
-#   NPM_TOKEN             — npm automation/granular token (later)
-#   # PyPI prefers OIDC trusted publishing (no long-lived token)
+# Secrets:
+#   CARGO_REGISTRY_TOKEN  — crates.io API token
+#   NPM_TOKEN             — npm automation token (Publish permission)
+# PyPI: configure Trusted Publisher (OIDC) on pypi.org for this workflow;
+#   fallback secret PYPI_API_TOKEN is also supported.
 
 name: Publish registries
 
@@ -26,7 +27,7 @@ on:
         required: true
         type: string
       ref:
-        description: "Git ref to package from (branch/sha/tag). Empty = use tag vVERSION. Set to main if the tag predates publish fixes."
+        description: "Git ref to package from (branch/sha/tag). Empty = use tag vVERSION. Use main if the tag predates packaging."
         required: false
         type: string
         default: ""
@@ -41,18 +42,19 @@ on:
         type: boolean
         default: true
       npm:
-        description: "Publish to npm (not implemented yet — job will fail clearly if enabled)"
+        description: "Publish to npm (platform packages then tokmesh)"
         required: true
         type: boolean
         default: false
       pypi:
-        description: "Publish to PyPI (not implemented yet — job will fail clearly if enabled)"
+        description: "Publish to PyPI (platform wheels + sdist)"
         required: true
         type: boolean
         default: false
 
 permissions:
   contents: read
+  id-token: write  # PyPI trusted publishing (OIDC)
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,8 +69,6 @@ jobs:
       tag: ${{ steps.ver.outputs.tag }}
       source_ref: ${{ steps.ver.outputs.source_ref }}
     steps:
-      # Always start on default branch so verify/bump scripts exist even when
-      # publishing an older tag that predates them.
       - uses: actions/checkout@v4
 
       - name: Normalize version and source ref
@@ -108,48 +108,32 @@ jobs:
         with:
           ref: ${{ needs.gate.outputs.source_ref }}
 
-      # bump-version.py may not exist on very old tags — fall back to default branch copy
       - name: Ensure bump-version script
         shell: bash
         run: |
           set -euo pipefail
           if [[ ! -f scripts/bump-version.py ]]; then
-            echo "scripts/bump-version.py missing on ${{ needs.gate.outputs.source_ref }}; fetching from default branch"
             git fetch origin "${{ github.event.repository.default_branch }}"
             git checkout "origin/${{ github.event.repository.default_branch }}" -- scripts/bump-version.py
           fi
           python3 scripts/bump-version.py "${{ needs.gate.outputs.version }}"
 
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: publish-crates
 
-      - name: Package check (all publishable crates)
+      - name: Package check
         run: |
           set -euo pipefail
-          # cargo package works with path deps. cargo publish --dry-run rewrites
-          # path→version and requires the dependency to already exist on
-          # crates.io, so only core gets a full publish dry-run until the
-          # first real publish lands.
-          cargo package -p tokmesh-core --list >/dev/null
-          cargo package -p tokmesh-cli --list >/dev/null
-          cargo package -p tokmesh --list >/dev/null
           cargo package -p tokmesh-core --allow-dirty --no-verify
           cargo package -p tokmesh-cli --allow-dirty --no-verify
           cargo package -p tokmesh --allow-dirty --no-verify
           cargo publish -p tokmesh-core --dry-run --allow-dirty
-          if cargo publish -p tokmesh-cli --dry-run --allow-dirty --no-verify; then
-            echo "tokmesh-cli publish dry-run ok"
-          else
-            echo "NOTE: tokmesh-cli publish dry-run needs tokmesh-core on crates.io (expected before first publish)"
-          fi
-          if cargo publish -p tokmesh --dry-run --allow-dirty --no-verify; then
-            echo "tokmesh publish dry-run ok"
-          else
-            echo "NOTE: tokmesh publish dry-run needs tokmesh-cli on crates.io (expected before first publish)"
-          fi
+          cargo publish -p tokmesh-cli --dry-run --allow-dirty --no-verify || \
+            echo "NOTE: tokmesh-cli dry-run needs tokmesh-core on crates.io"
+          cargo publish -p tokmesh --dry-run --allow-dirty --no-verify || \
+            echo "NOTE: tokmesh dry-run needs tokmesh-cli on crates.io"
 
       - name: Publish to crates.io
         if: ${{ inputs.dry_run == false }}
@@ -159,10 +143,8 @@ jobs:
           set -euo pipefail
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
             echo "ERROR: secrets.CARGO_REGISTRY_TOKEN is not set." >&2
-            echo "Create a crates.io API token (publish scope) and add it as a repo secret named CARGO_REGISTRY_TOKEN." >&2
             exit 1
           fi
-
           publish_one() {
             local pkg="$1"
             echo "==== cargo publish -p ${pkg} ===="
@@ -177,11 +159,9 @@ jobs:
             echo "ERROR: cargo publish -p ${pkg} failed after retries" >&2
             return 1
           }
-
           publish_one tokmesh-core
           publish_one tokmesh-cli
           publish_one tokmesh
-          echo "crates.io publish complete for ${{ needs.gate.outputs.version }}"
 
       - name: Dry-run notice
         if: ${{ inputs.dry_run }}
@@ -193,36 +173,122 @@ jobs:
     if: ${{ inputs.npm }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source ref
+        uses: actions/checkout@v4
         with:
           ref: ${{ needs.gate.outputs.source_ref }}
 
-      - name: npm packaging not ready
+      - name: Ensure packaging scripts
+        shell: bash
         run: |
           set -euo pipefail
           if [[ ! -d packaging/npm ]]; then
-            echo "ERROR: packaging/npm is not implemented yet." >&2
-            echo "Leave the npm input unchecked until the npm package skeleton lands." >&2
+            echo "ERROR: packaging/npm missing on ref ${{ needs.gate.outputs.source_ref }}" >&2
+            echo "Set ref=main for the first publish." >&2
             exit 1
           fi
-          echo "npm packaging present — implement publish steps next"
+          if [[ ! -f scripts/bump-version.py ]] || [[ ! -f scripts/prepare-npm-binaries.py ]]; then
+            git fetch origin "${{ github.event.repository.default_branch }}"
+            git checkout "origin/${{ github.event.repository.default_branch }}" -- \
+              scripts/bump-version.py scripts/prepare-npm-binaries.py packaging/npm || true
+          fi
+          python3 scripts/bump-version.py "${{ needs.gate.outputs.version }}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Stage native binaries from GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/prepare-npm-binaries.py "${{ needs.gate.outputs.version }}" --repo "${{ github.repository }}"
+
+      - name: Pack (dry-run style)
+        working-directory: packaging/npm
+        run: |
+          set -euo pipefail
+          for dir in tokmesh-linux-x64 tokmesh-linux-arm64 tokmesh-darwin-x64 tokmesh-darwin-arm64 tokmesh-windows-x64 tokmesh-windows-arm64 tokmesh; do
+            echo "==== npm pack ${dir} ===="
+            (cd "$dir" && npm pack --dry-run)
+          done
+
+      - name: Publish to npm
+        if: ${{ inputs.dry_run == false }}
+        working-directory: packaging/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "ERROR: secrets.NPM_TOKEN is not set." >&2
+            echo "Create an npm Access Token (Automation) and add repo secret NPM_TOKEN." >&2
+            exit 1
+          fi
+          # Platform packages first, then the meta package that depends on them.
+          for dir in tokmesh-linux-x64 tokmesh-linux-arm64 tokmesh-darwin-x64 tokmesh-darwin-arm64 tokmesh-windows-x64 tokmesh-windows-arm64; do
+            echo "==== npm publish ${dir} ===="
+            (cd "$dir" && npm publish --access public)
+          done
+          echo "==== npm publish tokmesh ===="
+          (cd tokmesh && npm publish --access public)
+
+      - name: Dry-run notice
+        if: ${{ inputs.dry_run }}
+        run: echo "dry_run=true — skipped real npm upload"
 
   pypi:
     name: PyPI
     needs: gate
     if: ${{ inputs.pypi }}
     runs-on: ubuntu-latest
+    # Optional: add `environment: pypi` and match that name in the PyPI
+    # trusted-publisher form for extra protection / required reviewers.
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source ref
+        uses: actions/checkout@v4
         with:
           ref: ${{ needs.gate.outputs.source_ref }}
 
-      - name: PyPI packaging not ready
+      - name: Ensure packaging scripts
+        shell: bash
         run: |
           set -euo pipefail
           if [[ ! -d packaging/pypi ]]; then
-            echo "ERROR: packaging/pypi is not implemented yet." >&2
-            echo "Leave the pypi input unchecked until the PyPI package skeleton lands." >&2
+            echo "ERROR: packaging/pypi missing on ref ${{ needs.gate.outputs.source_ref }}" >&2
+            echo "Set ref=main for the first publish." >&2
             exit 1
           fi
-          echo "PyPI packaging present — implement publish steps next"
+          if [[ ! -f scripts/build-pypi-wheels.py ]]; then
+            git fetch origin "${{ github.event.repository.default_branch }}"
+            git checkout "origin/${{ github.event.repository.default_branch }}" -- \
+              scripts/build-pypi-wheels.py scripts/bump-version.py packaging/pypi || true
+          fi
+          python3 scripts/bump-version.py "${{ needs.gate.outputs.version }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build wheels from GitHub Release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/build-pypi-wheels.py "${{ needs.gate.outputs.version }}" --repo "${{ github.repository }}" --out dist/pypi
+
+      - name: List artifacts
+        run: ls -la dist/pypi
+
+      - name: Publish to PyPI
+        if: ${{ inputs.dry_run == false }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/pypi
+          # If trusted publishing is not configured, set secret PYPI_API_TOKEN
+          # and uncomment:
+          # password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+          verbose: true
+
+      - name: Dry-run notice
+        if: ${{ inputs.dry_run }}
+        run: echo "dry_run=true — skipped real PyPI upload"

@@ -1,0 +1,30 @@
+{
+  "name": "tokmesh-windows-x64",
+  "version": "0.1.0",
+  "description": "tokmesh native binary for win32-x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xxxbrian/tokmesh.git"
+  },
+  "homepage": "https://github.com/xxxbrian/tokmesh",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "index.js",
+  "files": [
+    "tokmesh.exe",
+    "index.js",
+    "package.json"
+  ],
+  "preferUnplugged": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

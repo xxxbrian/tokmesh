@@ -9,16 +9,36 @@ Tokmesh is a hard fork of [tokscale](https://github.com/junhoyeo/tokscale). It k
 
 ## Install
 
-### From source
+### Cargo
 
 ```sh
+cargo install tokmesh --locked
+# or from git:
 cargo install --git https://github.com/xxxbrian/tokmesh --locked tokmesh
 # or, in a checkout:
 cargo build --release -p tokmesh
 ./target/release/tokmesh --help
 ```
 
-The installable package name is `tokmesh` (short crates.io / cargo name). Implementation lives in `tokmesh-cli`; the `tokmesh` crate is a thin wrapper that produces the same `tokmesh` binary.
+The installable package name is `tokmesh` (short crates.io name). Implementation lives in `tokmesh-cli`; the `tokmesh` crate is a thin wrapper that produces the same `tokmesh` binary.
+
+### npm
+
+```sh
+npm install -g tokmesh
+# or
+npx tokmesh --help
+```
+
+### PyPI
+
+```sh
+pipx install tokmesh
+# or
+uv tool install tokmesh
+# or
+pip install tokmesh
+```
 
 ### mise (GitHub Releases)
 

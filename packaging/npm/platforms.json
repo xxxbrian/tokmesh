@@ -1,0 +1,59 @@
+{
+  "version_note": "Keep in sync via scripts/bump-version.py",
+  "platforms": [
+    {
+      "dir": "tokmesh-linux-x64",
+      "name": "tokmesh-linux-x64",
+      "os": "linux",
+      "cpu": "x64",
+      "rust_target": "x86_64-unknown-linux-musl",
+      "binary": "tokmesh",
+      "ext": "tar.gz"
+    },
+    {
+      "dir": "tokmesh-linux-arm64",
+      "name": "tokmesh-linux-arm64",
+      "os": "linux",
+      "cpu": "arm64",
+      "rust_target": "aarch64-unknown-linux-musl",
+      "binary": "tokmesh",
+      "ext": "tar.gz"
+    },
+    {
+      "dir": "tokmesh-darwin-x64",
+      "name": "tokmesh-darwin-x64",
+      "os": "darwin",
+      "cpu": "x64",
+      "rust_target": "x86_64-apple-darwin",
+      "binary": "tokmesh",
+      "ext": "tar.gz"
+    },
+    {
+      "dir": "tokmesh-darwin-arm64",
+      "name": "tokmesh-darwin-arm64",
+      "os": "darwin",
+      "cpu": "arm64",
+      "rust_target": "aarch64-apple-darwin",
+      "binary": "tokmesh",
+      "ext": "tar.gz"
+    },
+    {
+      "dir": "tokmesh-windows-x64",
+      "name": "tokmesh-windows-x64",
+      "os": "win32",
+      "cpu": "x64",
+      "rust_target": "x86_64-pc-windows-msvc",
+      "binary": "tokmesh.exe",
+      "ext": "zip"
+    },
+    {
+      "dir": "tokmesh-windows-arm64",
+      "name": "tokmesh-windows-arm64",
+      "os": "win32",
+      "cpu": "arm64",
+      "rust_target": "aarch64-pc-windows-msvc",
+      "binary": "tokmesh.exe",
+      "ext": "zip"
+    }
+  ]
+}
