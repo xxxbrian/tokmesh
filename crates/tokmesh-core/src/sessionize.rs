@@ -285,7 +285,14 @@ fn compute_max_concurrent(intervals: &[SessionInterval]) -> u32 {
 pub fn compute_daily_active_time(
     intervals: &[SessionInterval],
 ) -> std::collections::HashMap<String, i64> {
-    compute_daily_active_time_with_timezone(intervals, &chrono::Local)
+    match crate::bucket_tz::bucket_timezone() {
+        crate::bucket_tz::BucketTimezone::Local => {
+            compute_daily_active_time_with_timezone(intervals, &chrono::Local)
+        }
+        crate::bucket_tz::BucketTimezone::Named(tz) => {
+            compute_daily_active_time_with_timezone(intervals, &tz)
+        }
+    }
 }
 
 fn compute_daily_active_time_with_timezone<Tz>(
@@ -319,8 +326,6 @@ where
         loop {
             let day_key = day.format("%Y-%m-%d").to_string();
             let Some(day_start) = local_day_start(day, timezone) else {
-                // DST gap: skip the rest of this interval when local midnight
-                // is not representable for the active timezone.
                 break;
             };
 
@@ -328,8 +333,6 @@ where
                 break;
             };
             let Some(next_day_start) = local_day_start(next_day, timezone) else {
-                // DST gap: skip the rest of this interval when the next local
-                // midnight is not representable for the active timezone.
                 break;
             };
 
@@ -372,12 +375,16 @@ fn local_day_start<Tz>(date: chrono::NaiveDate, timezone: &Tz) -> Option<i64>
 where
     Tz: chrono::TimeZone,
 {
-    let midnight = date.and_time(chrono::NaiveTime::MIN);
-    match timezone.from_local_datetime(&midnight) {
-        chrono::LocalResult::Single(datetime) => Some(datetime.timestamp_millis()),
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp_millis()),
-        chrono::LocalResult::None => None,
+    let mut wall = date.and_time(chrono::NaiveTime::MIN);
+    for _ in 0..=(24 * 60) {
+        match timezone.from_local_datetime(&wall) {
+            chrono::LocalResult::Single(datetime) | chrono::LocalResult::Ambiguous(datetime, _) => {
+                return Some(datetime.timestamp_millis());
+            }
+            chrono::LocalResult::None => wall += chrono::Duration::minutes(1),
+        }
     }
+    None
 }
 
 #[cfg(test)]
@@ -751,6 +758,21 @@ mod tests {
         assert_eq!(daily.get("2026-01-01"), Some(&1_800_000));
         assert_eq!(daily.get("2026-01-02"), Some(&1_800_000));
         assert_eq!(daily.len(), 2);
+    }
+
+    #[test]
+    fn test_local_day_start_walks_forward_across_midnight_dst_gap() {
+        let timezone = chrono_tz::America::Santiago;
+        let date = chrono::NaiveDate::from_ymd_opt(2019, 9, 8).unwrap();
+
+        let start = local_day_start(date, &timezone).unwrap();
+        let expected = timezone
+            .with_ymd_and_hms(2019, 9, 8, 1, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(start, expected);
     }
 
     #[test]

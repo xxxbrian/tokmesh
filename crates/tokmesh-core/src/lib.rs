@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 mod aggregator;
+pub mod bucket_tz;
 mod cc_mirror;
 pub mod clients;
 pub mod content_extractor;
@@ -20,6 +21,7 @@ pub mod tui_signal;
 pub mod wiki;
 
 pub use aggregator::*;
+pub use bucket_tz::{bucket_timezone, parse_bucket_timezone, set_bucket_timezone, BucketTimezone};
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
 pub use model_alias::ModelAliasMap;
 pub use parser::*;
@@ -2507,8 +2509,6 @@ struct HourAggregator {
 /// Derives the hour slot from `UnifiedMessage.timestamp` (Unix ms).
 /// Falls back to date + "00:00" when timestamp is zero or missing.
 pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, String> {
-    use chrono::{Local, TimeZone};
-
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -2537,11 +2537,9 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 
     for msg in filtered {
         let hour_key = if msg.timestamp > 0 {
-            let ts_secs = msg.timestamp / 1000;
-            match Local.timestamp_opt(ts_secs, 0) {
-                chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:00").to_string(),
-                _ => format!("{} 00:00", msg.date),
-            }
+            crate::bucket_tz::bucket_timezone()
+                .date_hour_of_ms(msg.timestamp)
+                .unwrap_or_else(|| format!("{} 00:00", msg.date))
         } else {
             format!("{} 00:00", msg.date)
         };

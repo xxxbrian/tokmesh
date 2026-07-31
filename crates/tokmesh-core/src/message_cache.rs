@@ -848,6 +848,10 @@ fn parser_version(client: ClientId) -> u32 {
         // the call start (timestamp - duration_ms) instead of the recorded
         // (end-anchored) timestamp.
         ClientId::OpenCodeReview => 2,
+        // v2->v3: turn_completed model usage now excludes reasoning from raw
+        // output, completed legacy fallback turns are retained, and signals
+        // reconciliation stays anchored to the earliest session activity.
+        ClientId::Grok => 3,
         // Kiro's structured messages.jsonl turns now back-calculate the
         // start anchor from `turn_end - elapsedTime` when the user prompt's
         // own timestamp is missing/unparseable, instead of falling through
@@ -2095,6 +2099,11 @@ mod tests {
     #[test]
     fn test_kimi_parser_version_invalidates_v2_entries() {
         assert_eq!(parser_version(ClientId::Kimi), 3);
+    }
+
+    #[test]
+    fn test_grok_parser_version_invalidates_v2_entries() {
+        assert_eq!(parser_version(ClientId::Grok), 3);
     }
 
     #[test]

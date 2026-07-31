@@ -13,8 +13,7 @@
 
 use super::utils::open_readonly_sqlite;
 use super::UnifiedMessage;
-use crate::TokenBreakdown;
-use chrono::{Local, TimeZone};
+use crate::{BucketTimezone, TokenBreakdown};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -193,7 +192,7 @@ fn load_assistant_buckets(conn: &Connection) -> HashMap<String, Vec<DayBucket>> 
         let Some(timestamp_ms) = normalize_crush_timestamp_ms(created_at) else {
             continue;
         };
-        let Some(local_day) = local_day_key(timestamp_ms) else {
+        let Some(local_day) = bucket_day_key(timestamp_ms, crate::bucket_timezone()) else {
             continue;
         };
 
@@ -224,11 +223,9 @@ fn normalize_crush_timestamp_ms(raw: i64) -> Option<i64> {
     }
 }
 
-fn local_day_key(timestamp_ms: i64) -> Option<String> {
-    match Local.timestamp_millis_opt(timestamp_ms) {
-        chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%d").to_string()),
-        _ => None,
-    }
+fn bucket_day_key(timestamp_ms: i64, timezone: BucketTimezone) -> Option<String> {
+    let date = timezone.date_of_ms(timestamp_ms);
+    (!date.is_empty()).then_some(date)
 }
 
 fn fallback_session_timestamp_ms(updated_at: i64, created_at: i64) -> Option<i64> {
@@ -240,6 +237,23 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use tempfile::TempDir;
+
+    #[test]
+    fn day_key_uses_pinned_timezone() {
+        use chrono::{TimeZone, Utc};
+
+        let timezone = crate::parse_bucket_timezone("Pacific/Kiritimati").unwrap();
+        let timestamp = Utc
+            .with_ymd_and_hms(2026, 7, 31, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            bucket_day_key(timestamp, timezone).as_deref(),
+            Some("2026-08-01")
+        );
+    }
 
     fn create_test_db(dir: &TempDir) -> std::path::PathBuf {
         let db_path = dir.path().join("crush.db");

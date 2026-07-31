@@ -36,4 +36,4 @@ Data is read **only** from local client logs and databases (Claude Code, Codex, 
 
 ## License
 
-MIT. Based on tokscale (Copyright (c) 2025 Junho Yeo).
+MIT. Includes work from [tokscale](https://github.com/junhoyeo/tokscale) (Copyright (c) 2025 Junho Yeo) and [tokens.ci](https://github.com/missuo/tokens) (Copyright (c) 2026 Vincent Yang). See [LICENSE](LICENSE).

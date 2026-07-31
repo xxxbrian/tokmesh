@@ -2,12 +2,27 @@
 //!
 //! Grok Build writes JSON-RPC session updates under
 //! `~/.grok/sessions/<urlencoded-workspace>/<session-id>/updates.jsonl`.
-//! Session rollups also land in sibling `signals.json` (including
-//! `totalTokensBeforeCompaction` and `contextTokensUsed`). Current update
-//! logs expose cumulative `totalTokens` counters without a stable
-//! input/output split, so this parser records per-turn positive total-token
-//! deltas as input tokens and reconciles any remaining `signals.json` total
-//! so compacted sessions are not under-counted.
+//!
+//! Current Grok Build versions emit authoritative per-turn usage on
+//! `sessionUpdate = "turn_completed"`:
+//!
+//! ```json
+//! "usage": {
+//!   "inputTokens": 429343,
+//!   "outputTokens": 5113,
+//!   "totalTokens": 434456,
+//!   "cachedReadTokens": 384512,
+//!   "reasoningTokens": 1268,
+//!   "modelCalls": 13,
+//!   "apiDurationMs": 93698,
+//!   "modelUsage": { "grok-4.5": { ... } }
+//! }
+//! ```
+//!
+//! Prefer that payload. Fall back to cumulative `_meta.totalTokens` deltas only
+//! for older transcripts that never recorded `turn_completed.usage`. Session
+//! rollups in sibling `signals.json` still reconcile residual totals in the
+//! fallback path so compacted legacy sessions are not under-counted.
 
 use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
@@ -30,6 +45,54 @@ struct GrokMetadata {
     timestamp: i64,
     workspace_key: Option<String>,
     workspace_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GrokUsageTotals {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    reasoning: i64,
+    model_calls: i64,
+    api_duration_ms: i64,
+}
+
+impl GrokUsageTotals {
+    fn from_usage_object(usage: &Value) -> Self {
+        let raw_input = non_negative_i64(usage.get("inputTokens"));
+        let raw_output = non_negative_i64(usage.get("outputTokens"));
+        let cache_read = non_negative_i64(usage.get("cachedReadTokens"))
+            .max(non_negative_i64(usage.get("cacheReadTokens")))
+            .min(raw_input);
+        let reasoning = non_negative_i64(usage.get("reasoningTokens"));
+        Self {
+            // Grok's inputTokens is the full prompt size and already includes
+            // cache hits. Split like the Codex parser so TokenBreakdown.total()
+            // and pricing do not double-count cache reads.
+            input: raw_input.saturating_sub(cache_read),
+            // Grok reports reasoning as a subset of outputTokens. Keep the
+            // useful split without counting or pricing those tokens twice.
+            output: raw_output.saturating_sub(reasoning),
+            cache_read,
+            reasoning,
+            model_calls: non_negative_i64(usage.get("modelCalls")),
+            api_duration_ms: non_negative_i64(usage.get("apiDurationMs")),
+        }
+    }
+
+    fn has_signal(self) -> bool {
+        self.input > 0 || self.output > 0 || self.cache_read > 0 || self.reasoning > 0
+    }
+
+    fn into_tokens(self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write: 0,
+            reasoning: self.reasoning,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +170,8 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
         Err(_) => return Vec::new(),
     };
 
-    let mut messages = Vec::new();
+    let mut usage_messages = Vec::new();
+    let mut fallback_messages = Vec::new();
     let mut current_model = metadata
         .model_id
         .clone()
@@ -116,6 +180,8 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut last_total_timestamp = metadata.timestamp;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut turn_index = 0usize;
+    let mut usage_turn_index = 0usize;
+    let mut saw_turn_completed_usage = false;
 
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -136,10 +202,39 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
         }
 
         let timestamp = extract_timestamp_ms(&value).unwrap_or(metadata.timestamp);
+
+        if let Some(messages) = extract_turn_completed_usage_messages(
+            &value,
+            &metadata,
+            &current_model,
+            usage_turn_index,
+        ) {
+            saw_turn_completed_usage = true;
+            usage_turn_index = usage_turn_index.saturating_add(1);
+            for message in messages {
+                if let Some(model_id) =
+                    Some(message.model_id.clone()).filter(|id| id != UNKNOWN_MODEL)
+                {
+                    current_model = model_id;
+                }
+                usage_messages.push(message);
+            }
+            // Authoritative usage already covers this turn; do not also invent a
+            // cumulative-total fallback turn from the same rows.
+            active_turn = None;
+            continue;
+        }
+
+        // Once a transcript has real turn usage, skip the legacy cumulative
+        // counter path entirely so we never double-count.
+        if saw_turn_completed_usage {
+            continue;
+        }
+
         if is_user_message_chunk(&value) {
             if let Some(turn) = active_turn.take() {
                 if let Some(message) = turn.into_message(&metadata) {
-                    messages.push(message);
+                    fallback_messages.push(message);
                 }
             }
 
@@ -161,9 +256,24 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
 
         match last_total {
             Some(previous) if total_tokens < previous => {
-                // Grok sometimes repeats or rewinds intermediate counters while
-                // streaming tool updates. Treat cumulative totals as monotonic.
-                continue;
+                // Compaction / rewind lowers the live context counter. Finalize
+                // the in-flight turn against the pre-drop high-water mark, then
+                // restart tracking from the post-compaction baseline so later
+                // growth is not permanently ignored.
+                if let Some(turn) = active_turn.take() {
+                    if let Some(message) = turn.into_message(&metadata) {
+                        fallback_messages.push(message);
+                    }
+                }
+                last_total = Some(total_tokens);
+                last_total_timestamp = timestamp;
+                active_turn = Some(ActiveTurn::new(
+                    total_tokens,
+                    timestamp,
+                    current_model.clone(),
+                    turn_index,
+                ));
+                turn_index = turn_index.saturating_add(1);
             }
             Some(previous) if total_tokens == previous => {
                 last_total_timestamp = timestamp;
@@ -194,13 +304,20 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
         }
     }
 
+    if saw_turn_completed_usage {
+        // Completed legacy turns predate the first authoritative event and do
+        // not overlap it. The active turn was discarded when the event arrived.
+        fallback_messages.extend(usage_messages);
+        return fallback_messages;
+    }
+
     if let Some(turn) = active_turn {
         if let Some(message) = turn.into_message(&metadata) {
-            messages.push(message);
+            fallback_messages.push(message);
         }
     }
 
-    if messages.is_empty() {
+    if fallback_messages.is_empty() {
         if let Some(total_tokens) = last_total.filter(|tokens| *tokens > 0) {
             let aggregate_turn = ActiveTurn {
                 baseline_total: 0,
@@ -210,13 +327,115 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                 turn_index: 0,
             };
             if let Some(message) = aggregate_turn.into_message(&metadata) {
-                messages.push(message);
+                fallback_messages.push(message);
             }
         }
     }
 
-    append_signals_reconciliation(path, &metadata, &mut messages, &current_model);
-    messages
+    append_signals_reconciliation(path, &metadata, &mut fallback_messages, &current_model);
+    fallback_messages
+}
+
+fn extract_turn_completed_usage_messages(
+    value: &Value,
+    metadata: &GrokMetadata,
+    fallback_model: &str,
+    turn_index: usize,
+) -> Option<Vec<UnifiedMessage>> {
+    let update = get_path(value, &["params", "update"])?;
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("turn_completed") {
+        return None;
+    }
+
+    let usage = update.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+
+    let timestamp = extract_timestamp_ms(value)
+        .or_else(|| {
+            get_path(value, &["params", "_meta", "agentTimestampMs"])
+                .and_then(parse_timestamp_value)
+        })
+        .unwrap_or(metadata.timestamp);
+
+    let mut messages = Vec::new();
+    if let Some(model_usage) = usage.get("modelUsage").and_then(|v| v.as_object()) {
+        for (model_id, model_usage_value) in model_usage {
+            if !model_usage_value.is_object() {
+                continue;
+            }
+            let totals = GrokUsageTotals::from_usage_object(model_usage_value);
+            if !totals.has_signal() {
+                continue;
+            }
+            let model = if model_id.trim().is_empty() {
+                fallback_model.to_string()
+            } else {
+                model_id.clone()
+            };
+            messages.push(build_usage_message(
+                metadata, &model, timestamp, totals, turn_index, model_id,
+            ));
+        }
+    }
+
+    if messages.is_empty() {
+        let totals = GrokUsageTotals::from_usage_object(usage);
+        if !totals.has_signal() {
+            return None;
+        }
+        let model = metadata
+            .model_id
+            .clone()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| fallback_model.to_string());
+        messages.push(build_usage_message(
+            metadata, &model, timestamp, totals, turn_index, "top",
+        ));
+    }
+
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages)
+    }
+}
+
+fn build_usage_message(
+    metadata: &GrokMetadata,
+    model_id: &str,
+    timestamp: i64,
+    totals: GrokUsageTotals,
+    turn_index: usize,
+    model_key: &str,
+) -> UnifiedMessage {
+    let mut message = UnifiedMessage::new_with_dedup(
+        CLIENT_ID,
+        model_id.to_string(),
+        PROVIDER_ID,
+        metadata.session_id.clone(),
+        timestamp,
+        totals.into_tokens(),
+        0.0,
+        Some(format!(
+            "grok:{}:usage:{}:{}",
+            metadata.session_id, turn_index, model_key
+        )),
+    );
+    message.set_workspace(
+        metadata.workspace_key.clone(),
+        metadata.workspace_label.clone(),
+    );
+    message.is_turn_start = true;
+    if totals.api_duration_ms > 0 {
+        message.duration_ms = Some(totals.api_duration_ms);
+    }
+    if totals.model_calls > 0 {
+        // One turn_completed can cover multiple internal model calls.
+        message.message_count = totals.model_calls.min(i64::from(i32::MAX)) as i32;
+    }
+    message
 }
 
 fn non_negative_i64(value: Option<&Value>) -> i64 {
@@ -266,7 +485,10 @@ fn append_signals_reconciliation(
         return;
     }
 
-    let updates_total: i64 = messages.iter().map(|message| message.tokens.input).sum();
+    let updates_total = messages
+        .iter()
+        .map(|message| message.tokens.input)
+        .fold(0_i64, i64::saturating_add);
     let extra = signals_total.saturating_sub(updates_total);
     if extra <= 0 {
         return;
@@ -276,16 +498,14 @@ fn append_signals_reconciliation(
         .filter(|model| !model.trim().is_empty())
         .or_else(|| metadata.model_id.clone())
         .unwrap_or_else(|| fallback_model.to_string());
-    // Anchor the reconciliation delta to the last recorded update activity rather
-    // than signals.json's mtime. The mtime advances every time Grok rewrites the
-    // rollup for a live session, which would migrate this whole (potentially
-    // multi-million-token) extra to a new day on each rescan and retroactively
-    // shrink the prior day's total. The last update timestamp only moves when
-    // genuine new activity is recorded, so the delta stays put across rescans.
+    // The residual represents compacted history with no per-turn timestamps.
+    // Anchor it to the earliest retained activity so appending a new day cannot
+    // migrate the whole historical residual into the latest day.
     let timestamp = messages
         .iter()
         .map(|message| message.timestamp)
-        .max()
+        .filter(|timestamp| *timestamp > 0)
+        .min()
         .unwrap_or(metadata.timestamp);
 
     let mut message = UnifiedMessage::new_with_dedup(
@@ -437,12 +657,13 @@ fn extract_model_id(value: &Value) -> Option<String> {
 }
 
 fn extract_total_tokens(value: &Value) -> Option<i64> {
+    // Only the live context counter paths. Do not read turn_completed.usage.totalTokens
+    // here — that is absolute per-turn API usage and is handled separately.
     for path in [
         &["params", "_meta", "totalTokens"][..],
         &["params", "update", "_meta", "totalTokens"][..],
         &["params", "update", "totalTokens"][..],
         &["params", "totalTokens"][..],
-        &["usage", "totalTokens"][..],
         &["totalTokens"][..],
     ] {
         if let Some(total) = get_path(value, path).and_then(|value| extract_i64(Some(value))) {
@@ -551,13 +772,13 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].client, "grok");
         assert_eq!(messages[0].model_id, "grok-composer-2.5-fast");
         assert_eq!(messages[0].provider_id, "xai");
         assert_eq!(messages[0].session_id, "session-1");
         assert_eq!(messages[0].tokens.input, 200);
-        assert_eq!(messages[0].tokens.output, 0);
         assert_eq!(messages[0].timestamp, 1700000003000);
         assert_eq!(messages[0].workspace_key.as_deref(), Some("/tmp/project"));
         assert_eq!(messages[0].workspace_label.as_deref(), Some("project"));
@@ -577,13 +798,14 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "grok-composer-2.5-fast");
         assert_eq!(messages[0].tokens.input, 220);
     }
 
     #[test]
-    fn ignores_repeated_and_decreasing_total_tokens() {
+    fn resets_fallback_tracking_after_total_tokens_decrease() {
         let (_temp, path) = write_fixture(
             r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"available_commands_update"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000000000}}}
 {"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-composer-2.5-fast"}},"_meta":{"agentTimestampMs":1700000001000}}}
@@ -596,9 +818,12 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].tokens.input, 100);
-        assert_eq!(messages[0].timestamp, 1700000005000);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.input, 50);
+        assert_eq!(messages[0].timestamp, 1700000002000);
+        assert_eq!(messages[1].tokens.input, 80);
+        assert_eq!(messages[1].timestamp, 1700000005000);
     }
 
     #[test]
@@ -610,6 +835,7 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, UNKNOWN_MODEL);
         assert_eq!(messages[0].tokens.input, 120);
@@ -626,6 +852,7 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, UNKNOWN_MODEL);
         assert_eq!(messages[0].tokens.input, 150);
@@ -644,6 +871,7 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 171056);
         assert_eq!(messages[1].tokens.input, 3225912);
@@ -652,6 +880,7 @@ mod tests {
             messages[1].dedup_key.as_deref(),
             Some("grok:session-1:signals")
         );
+        assert_eq!(messages[1].timestamp, 1700000001000);
         assert_eq!(
             messages
                 .iter()
@@ -659,30 +888,6 @@ mod tests {
                 .sum::<i64>(),
             3396968
         );
-    }
-
-    #[test]
-    fn signals_reconciliation_anchors_timestamp_to_last_update_not_file_mtime() {
-        // The signals.json is written "now" (mtime far in the future relative to
-        // the update timestamps). The reconciliation delta must be dated by the
-        // last recorded update (1700000001000), NOT the signals.json mtime, so a
-        // live session's extra does not migrate to a new day on every rescan.
-        let (_temp, path) = write_fixture(
-            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-build"}},"_meta":{"agentTimestampMs":1700000000000}}}
-{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":171056,"agentTimestampMs":1700000001000}}}"#,
-            None,
-            Some(
-                r#"{"primaryModelId":"grok-build","totalTokensBeforeCompaction":3224659,"contextTokensUsed":172309}"#,
-            ),
-        );
-
-        let messages = parse_grok_updates_file(&path);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(
-            messages[1].dedup_key.as_deref(),
-            Some("grok:session-1:signals")
-        );
-        assert_eq!(messages[1].timestamp, 1700000001000);
     }
 
     #[test]
@@ -695,6 +900,7 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 500);
     }
@@ -708,9 +914,214 @@ mod tests {
         );
 
         let messages = parse_grok_updates_file(&path);
+
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 50);
         assert_eq!(messages[1].tokens.input, 200);
         assert_eq!(messages[1].model_id, "grok-composer-2.5-fast");
+    }
+
+    #[test]
+    fn turn_completed_model_usage_is_authoritative() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"available_commands_update"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-4.5"}},"_meta":{"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":300,"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":9999,"outputTokens":9999,"cachedReadTokens":0,"reasoningTokens":9999,"modelUsage":{"grok-4.5":{"inputTokens":1000,"outputTokens":120,"cachedReadTokens":800,"reasoningTokens":20,"modelCalls":3,"apiDurationMs":4500}}}},"_meta":{"totalTokens":999,"agentTimestampMs":1700000003000}}}"#,
+            None,
+            Some(
+                r#"{"primaryModelId":"grok-build","totalTokensBeforeCompaction":900000,"contextTokensUsed":100000}"#,
+            ),
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "fallback and signals usage must be ignored"
+        );
+        let message = &messages[0];
+        assert_eq!(message.model_id, "grok-4.5");
+        assert_eq!(message.tokens.input, 200);
+        assert_eq!(message.tokens.cache_read, 800);
+        assert_eq!(message.tokens.output, 100);
+        assert_eq!(message.tokens.reasoning, 20);
+        assert_eq!(message.tokens.total(), 1120);
+        assert_eq!(message.duration_ms, Some(4500));
+        assert_eq!(message.message_count, 3);
+        assert_eq!(message.timestamp, 1700000003000);
+        assert_eq!(
+            message.dedup_key.as_deref(),
+            Some("grok:session-1:usage:0:grok-4.5")
+        );
+        assert!(message.is_turn_start);
+    }
+
+    #[test]
+    fn turn_completed_splits_model_usage_without_counting_top_level_totals() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":5000,"outputTokens":500,"modelUsage":{"grok-4.5":{"inputTokens":1000,"outputTokens":100,"cachedReadTokens":750,"reasoningTokens":10,"modelCalls":2,"apiDurationMs":3000},"grok-4-mini":{"inputTokens":400,"outputTokens":40,"cacheReadTokens":100,"reasoningTokens":4,"modelCalls":1,"apiDurationMs":500}}}},"_meta":{"agentTimestampMs":1700000000000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        let large = messages
+            .iter()
+            .find(|message| message.model_id == "grok-4.5")
+            .unwrap();
+        assert_eq!(large.tokens.input, 250);
+        assert_eq!(large.tokens.cache_read, 750);
+        assert_eq!(large.tokens.output, 90);
+        assert_eq!(large.tokens.reasoning, 10);
+        assert_eq!(large.tokens.total(), 1100);
+        assert_eq!(large.message_count, 2);
+        assert_eq!(large.duration_ms, Some(3000));
+
+        let mini = messages
+            .iter()
+            .find(|message| message.model_id == "grok-4-mini")
+            .unwrap();
+        assert_eq!(mini.tokens.input, 300);
+        assert_eq!(mini.tokens.cache_read, 100);
+        assert_eq!(mini.tokens.output, 36);
+        assert_eq!(mini.tokens.reasoning, 4);
+        assert_eq!(mini.tokens.total(), 440);
+        assert_eq!(mini.message_count, 1);
+        assert_eq!(mini.duration_ms, Some(500));
+    }
+
+    #[test]
+    fn turn_completed_uses_top_level_usage_when_model_usage_is_absent() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":500,"outputTokens":50,"cachedReadTokens":200,"reasoningTokens":5,"modelCalls":4,"apiDurationMs":2000}},"_meta":{"agentTimestampMs":1700000000000}}}"#,
+            Some(r#"{"current_model_id":"grok-build"}"#),
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "grok-build");
+        assert_eq!(messages[0].tokens.input, 300);
+        assert_eq!(messages[0].tokens.cache_read, 200);
+        assert_eq!(messages[0].tokens.output, 45);
+        assert_eq!(messages[0].tokens.reasoning, 5);
+        assert_eq!(messages[0].tokens.total(), 550);
+        assert_eq!(messages[0].message_count, 4);
+        assert_eq!(messages[0].duration_ms, Some(2000));
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("grok:session-1:usage:0:top")
+        );
+    }
+
+    #[test]
+    fn turn_completed_dedup_keys_advance_per_turn() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"outputTokens":10}},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":200,"outputTokens":20}},"_meta":{"agentTimestampMs":1700000001000}}}"#,
+            Some(r#"{"current_model_id":"grok-build"}"#),
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("grok:session-1:usage:0:top")
+        );
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some("grok:session-1:usage:1:top")
+        );
+        assert_eq!(messages[0].timestamp, 1700000000000);
+        assert_eq!(messages[1].timestamp, 1700000001000);
+    }
+
+    #[test]
+    fn zero_signal_turn_completed_keeps_legacy_fallback_active() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"available_commands_update"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":0,"outputTokens":0,"cachedReadTokens":0,"reasoningTokens":0}},"_meta":{"totalTokens":250,"agentTimestampMs":1700000002000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 150);
+        assert_eq!(messages[0].timestamp, 1700000002000);
+    }
+
+    #[test]
+    fn turn_completed_keeps_completed_legacy_turns() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000002000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":20,"outputTokens":5}},"_meta":{"agentTimestampMs":1700000003000}}}"#,
+            Some(r#"{"current_model_id":"grok-build"}"#),
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[1].tokens.total(), 25);
+    }
+
+    #[test]
+    fn signals_residual_stays_on_earliest_activity_when_session_grows() {
+        let (temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000001000}}}"#,
+            Some(r#"{"current_model_id":"grok-build"}"#),
+            Some(r#"{"primaryModelId":"grok-build","totalTokens":1000}"#),
+        );
+        let first = parse_grok_updates_file(&path);
+        let first_residual = first
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("grok:session-1:signals"))
+            .unwrap();
+        assert_eq!(first_residual.timestamp, 1700000001000);
+
+        std::fs::write(
+            &path,
+            r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":100,"agentTimestampMs":1700000001000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1700086400000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":200,"agentTimestampMs":1700086401000}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path()
+                .join(".grok/sessions/%2Ftmp%2Fproject/session-1/signals.json"),
+            r#"{"primaryModelId":"grok-build","totalTokens":1100}"#,
+        )
+        .unwrap();
+
+        let second = parse_grok_updates_file(&path);
+        let second_residual = second
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("grok:session-1:signals"))
+            .unwrap();
+        assert_eq!(second_residual.tokens.input, 900);
+        assert_eq!(second_residual.timestamp, first_residual.timestamp);
+    }
+
+    #[test]
+    fn unsigned_usage_values_clamp_instead_of_wrapping() {
+        assert_eq!(
+            non_negative_i64(Some(&serde_json::json!(u64::MAX))),
+            i64::MAX
+        );
     }
 }

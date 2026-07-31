@@ -32,6 +32,8 @@ walkdir = "2"
 
 # Date/time handling
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 
 # Error handling
 thiserror = "2"

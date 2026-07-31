@@ -124,6 +124,12 @@ fn contains_delimited(haystack: &str, needle: &str) -> bool {
 pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
 
+    // Ollama is a routing prefix, not a model family. Without stripping it,
+    // the `llama` substring in `ollama/...` misattributes unknown models to Meta.
+    if let Some(routed_model) = lower.strip_prefix("ollama/") {
+        return inferred_provider_from_model(routed_model);
+    }
+
     if lower.contains("claude")
         || lower.contains("anthropic")
         || contains_delimited(&lower, "opus")
@@ -308,6 +314,19 @@ mod tests {
         assert_eq!(inferred_provider_from_model("llama-3"), Some("meta"));
         assert_eq!(inferred_provider_from_model("qwen3-coder"), Some("qwen"));
         assert_eq!(inferred_provider_from_model("unknown-model"), None);
+    }
+
+    #[test]
+    fn test_inferred_provider_ignores_ollama_route_prefix() {
+        assert_eq!(inferred_provider_from_model("ollama/orca-mini"), None);
+        assert_eq!(
+            inferred_provider_from_model("ollama/qwen3-coder"),
+            Some("qwen")
+        );
+        assert_eq!(
+            inferred_provider_from_model("ollama/llama-3.3"),
+            Some("meta")
+        );
     }
 
     #[test]

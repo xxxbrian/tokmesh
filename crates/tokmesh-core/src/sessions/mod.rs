@@ -345,10 +345,12 @@ impl UnifiedMessage {
         agent: Option<String>,
         dedup_key: Option<String>,
     ) -> Self {
+        let client = client.into();
+        let model_id = model_id.into();
         let date = timestamp_to_date(timestamp);
         Self {
-            client: client.into(),
-            model_id: model_id.into(),
+            client,
+            model_id,
             provider_id: provider_id.into(),
             session_id: session_id.into(),
             workspace_key: None,
@@ -440,9 +442,12 @@ pub fn workspace_label_from_key(key: &str) -> Option<String> {
 
 /// Convert Unix milliseconds to a local YYYY-MM-DD date string.
 fn timestamp_to_date(timestamp_ms: i64) -> String {
-    timestamp_to_date_with_timezone(timestamp_ms, &chrono::Local)
+    // Prefer the process-wide pinned bucketing timezone when set (tokens.ci
+    // travel-proof submit); otherwise fall back to the machine local zone.
+    crate::bucket_tz::bucket_timezone().date_of_ms(timestamp_ms)
 }
 
+#[cfg(test)]
 fn timestamp_to_date_with_timezone<Tz>(timestamp_ms: i64, timezone: &Tz) -> String
 where
     Tz: chrono::TimeZone,
