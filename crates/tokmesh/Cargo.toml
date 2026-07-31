@@ -1,0 +1,24 @@
+[package]
+name = "tokmesh"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Local AI coding token analytics CLI and TUI"
+keywords = ["tokmesh", "tokens", "cli", "tui", "usage"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "tokmesh"
+path = "src/main.rs"
+
+[features]
+# Forward optional Apple Foundation Models backend to the implementation crate.
+apple-fm = ["tokmesh-cli/apple-fm"]
+
+[dependencies]
+tokmesh-cli = { workspace = true }
+anyhow = { workspace = true }

@@ -7,12 +7,33 @@ Tokmesh is a hard fork of [tokscale](https://github.com/junhoyeo/tokscale). It k
 - [tokscale.ai](https://tokscale.ai)
 - [tokens.ci](https://tokens.ci)
 
-## Build
+## Install
+
+### From source
 
 ```sh
-cargo build --release -p tokmesh-cli
+cargo install --git https://github.com/xxxbrian/tokmesh --locked tokmesh
+# or, in a checkout:
+cargo build --release -p tokmesh
 ./target/release/tokmesh --help
 ```
+
+The installable package name is `tokmesh` (short crates.io / cargo name). Implementation lives in `tokmesh-cli`; the `tokmesh` crate is a thin wrapper that produces the same `tokmesh` binary.
+
+### mise (GitHub Releases)
+
+After a `v*` tag release exists:
+
+```sh
+mise use -g github:xxxbrian/tokmesh
+tokmesh --help
+```
+
+Release assets are named `tokmesh-{version}-{rust-target}.tar.gz` (`.zip` on Windows) with a `tokmesh` binary inside, so mise can auto-select your platform.
+
+### GitHub Releases
+
+Download the archive for your target from the [Releases](https://github.com/xxxbrian/tokmesh/releases) page, extract, and put `tokmesh` on your `PATH`.
 
 ## Local usage
 

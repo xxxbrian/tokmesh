@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Core library for tokmesh - session parsing, scanning, aggregation, pricing"
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Core library for tokmesh — session parsing, scanning, aggregation, pricing"
+keywords = ["tokmesh", "tokens", "usage"]
+categories = ["parsing", "development-tools"]
 
 [lib]
 crate-type = ["rlib"]

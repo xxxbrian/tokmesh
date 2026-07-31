@@ -1,0 +1,216 @@
+# Build tokmesh release binaries and attach them to a GitHub Release.
+#
+# Trigger: push a version tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`
+# (Creating a GitHub Release that creates the same tag also works.)
+#
+# Asset naming (mise / cargo-binstall friendly):
+#   tokmesh-{version}-{rust-target}.tar.gz   (unix)
+#   tokmesh-{version}-{rust-target}.zip      (windows)
+# Archive root contains the executable `tokmesh` or `tokmesh.exe` only.
+#
+# Builds the thin `tokmesh` package (short cargo name), which links the
+# `tokmesh-cli` implementation library and produces the `tokmesh` binary.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse version from tag
+        id: ver
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Sync Cargo version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          python3 - <<'PY' "$VERSION"
+          import pathlib, re, sys
+          version = sys.argv[1]
+          path = pathlib.Path("Cargo.toml")
+          text = path.read_text()
+          updated, n = re.subn(
+              r'(?m)^(\[workspace\.package\]\n(?:(?!^\[).*\n)*?^version = ")([^"]+)(")',
+              rf"\g<1>{version}\g<3>",
+              text,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit("failed to patch [workspace.package] version")
+          path.write_text(updated)
+          print(f"workspace version -> {version}")
+          PY
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+        if: matrix.zig
+        with:
+          version: 0.13.0
+
+      - uses: taiki-e/install-action@v2
+        if: matrix.zig
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release -p tokmesh --target "${{ matrix.target }}"
+          else
+            cargo build --release -p tokmesh --target "${{ matrix.target }}"
+          fi
+
+      - name: Package
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          BIN_DIR="target/${TARGET}/release"
+          OUT_DIR="${RUNNER_TEMP}/tokmesh-dist"
+          mkdir -p "${OUT_DIR}"
+
+          if [[ "${TARGET}" == *windows* ]]; then
+            SRC="${BIN_DIR}/tokmesh.exe"
+            test -f "${SRC}"
+            ASSET="tokmesh-${VERSION}-${TARGET}.zip"
+            # Git Bash `tar` treats `D:\...` as a remote host (`D`). Stay in a
+            # relative working directory and zip with PowerShell.
+            STAGE="${OUT_DIR}/stage"
+            rm -rf "${STAGE}"
+            mkdir -p "${STAGE}"
+            cp "${SRC}" "${STAGE}/tokmesh.exe"
+            (
+              cd "${STAGE}"
+              powershell.exe -NoProfile -Command \
+                "Compress-Archive -Path 'tokmesh.exe' -DestinationPath 'tokmesh.zip' -Force"
+              mv -f tokmesh.zip "${OUT_DIR}/${ASSET}"
+            )
+          else
+            SRC="${BIN_DIR}/tokmesh"
+            test -f "${SRC}"
+            # Best-effort strip; ignore failures on exotic targets.
+            strip "${SRC}" 2>/dev/null || true
+            ASSET="tokmesh-${VERSION}-${TARGET}.tar.gz"
+            tar -C "${BIN_DIR}" -czf "${OUT_DIR}/${ASSET}" tokmesh
+          fi
+
+          echo "asset_path=${OUT_DIR}/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${ASSET}" >> "$GITHUB_OUTPUT"
+          ls -la "${OUT_DIR}/${ASSET}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokmesh-${{ matrix.target }}
+          path: ${{ steps.pack.outputs.asset_path }}
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse version from tag
+        id: ver
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp -v {} release-assets/ \;
+          ls -la release-assets
+          test "$(find release-assets -type f | wc -l)" -ge 1
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for f in *; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: tokmesh ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
