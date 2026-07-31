@@ -6,16 +6,15 @@
 #      assets + checksums). Incomplete or missing releases abort first.
 #   3. dry_run defaults to true so a mistaken click cannot publish.
 #
+# Auth: Trusted Publishing (OIDC) for crates.io, npm, and PyPI.
+# Configure each registry's trusted publisher for this exact workflow file
+# (`publish-registries.yml`), owner `xxxbrian`, repo `tokmesh`, no environment.
+# No long-lived CARGO_REGISTRY_TOKEN / NPM_TOKEN / PYPI_API_TOKEN required.
+#
 # Typical flow:
 #   scripts/bump-version.py X.Y.Z → commit → tag vX.Y.Z → push →
 #   wait for Release (binaries) → Actions → Publish registries →
 #   version=X.Y.Z, dry_run=false, select crates/npm/pypi
-#
-# Secrets:
-#   CARGO_REGISTRY_TOKEN  — crates.io API token
-#   NPM_TOKEN             — npm automation token (Publish permission)
-# PyPI: configure Trusted Publisher (OIDC) on pypi.org for this workflow;
-#   fallback secret PYPI_API_TOKEN is also supported.
 
 name: Publish registries
 
@@ -54,7 +53,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # PyPI trusted publishing (OIDC)
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,6 +101,9 @@ jobs:
     needs: gate
     if: ${{ inputs.crates }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout source ref
         uses: actions/checkout@v4
@@ -131,18 +133,24 @@ jobs:
           cargo package -p tokmesh --allow-dirty --no-verify
           cargo publish -p tokmesh-core --dry-run --allow-dirty
           cargo publish -p tokmesh-cli --dry-run --allow-dirty --no-verify || \
-            echo "NOTE: tokmesh-cli dry-run needs tokmesh-core on crates.io"
+            echo "NOTE: tokmesh-cli dry-run needs tokmesh-core on crates.io (ok if already published)"
           cargo publish -p tokmesh --dry-run --allow-dirty --no-verify || \
-            echo "NOTE: tokmesh dry-run needs tokmesh-cli on crates.io"
+            echo "NOTE: tokmesh dry-run needs tokmesh-cli on crates.io (ok if already published)"
+
+      - name: Authenticate to crates.io (OIDC)
+        if: ${{ inputs.dry_run == false }}
+        uses: rust-lang/crates-io-auth-action@v1
+        id: crates_auth
 
       - name: Publish to crates.io
         if: ${{ inputs.dry_run == false }}
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
         run: |
           set -euo pipefail
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "ERROR: secrets.CARGO_REGISTRY_TOKEN is not set." >&2
+            echo "ERROR: OIDC crates.io token empty. Check Trusted Publishing on each crate" >&2
+            echo "(tokmesh-core, tokmesh-cli, tokmesh) for workflow publish-registries.yml." >&2
             exit 1
           fi
           publish_one() {
@@ -165,32 +173,35 @@ jobs:
 
       - name: Dry-run notice
         if: ${{ inputs.dry_run }}
-        run: echo "dry_run=true — skipped real crates.io upload"
+        run: echo "dry_run=true — skipped real crates.io upload (OIDC auth not requested)"
 
   npm:
     name: npm
     needs: gate
     if: ${{ inputs.npm }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout source ref
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.gate.outputs.source_ref }}
 
-      - name: Ensure packaging scripts
+      - name: Ensure packaging sources
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -d packaging/npm ]]; then
-            echo "ERROR: packaging/npm missing on ref ${{ needs.gate.outputs.source_ref }}" >&2
-            echo "Set ref=main for the first publish." >&2
+          if [[ ! -d packaging/npm/tokmesh ]]; then
+            echo "ERROR: packaging/npm/tokmesh missing on ref ${{ needs.gate.outputs.source_ref }}" >&2
+            echo "Set ref=main for the first publish after packaging landed." >&2
             exit 1
           fi
-          if [[ ! -f scripts/bump-version.py ]] || [[ ! -f scripts/prepare-npm-binaries.py ]]; then
+          if [[ ! -f scripts/bump-version.py ]]; then
             git fetch origin "${{ github.event.repository.default_branch }}"
             git checkout "origin/${{ github.event.repository.default_branch }}" -- \
-              scripts/bump-version.py scripts/prepare-npm-binaries.py packaging/npm || true
+              scripts/bump-version.py packaging/npm || true
           fi
           python3 scripts/bump-version.py "${{ needs.gate.outputs.version }}"
 
@@ -199,24 +210,22 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      # Single package `tokmesh`: downloads the matching GitHub Release binary
-      # on postinstall / first run. No platform sub-packages.
+      # OIDC trusted publishing needs a recent npm CLI.
+      - name: Upgrade npm for OIDC publish
+        run: npm install -g npm@latest
+
       - name: Pack (dry-run style)
         working-directory: packaging/npm/tokmesh
         run: npm pack --dry-run
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC Trusted Publisher)
         if: ${{ inputs.dry_run == false }}
         working-directory: packaging/npm/tokmesh
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
-            echo "ERROR: secrets.NPM_TOKEN is not set (or use Trusted Publisher / local first publish)." >&2
-            exit 1
-          fi
-          npm publish --access public
+          # No NODE_AUTH_TOKEN — npm exchanges the GitHub OIDC token when a
+          # Trusted Publisher is configured for this workflow on the package.
+          npm publish --access public --provenance
 
       - name: Dry-run notice
         if: ${{ inputs.dry_run }}
@@ -227,8 +236,9 @@ jobs:
     needs: gate
     if: ${{ inputs.pypi }}
     runs-on: ubuntu-latest
-    # Optional: add `environment: pypi` and match that name in the PyPI
-    # trusted-publisher form for extra protection / required reviewers.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout source ref
         uses: actions/checkout@v4
@@ -263,14 +273,11 @@ jobs:
       - name: List artifacts
         run: ls -la dist/pypi
 
-      - name: Publish to PyPI
+      - name: Publish to PyPI (OIDC Trusted Publisher)
         if: ${{ inputs.dry_run == false }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/pypi
-          # If trusted publishing is not configured, set secret PYPI_API_TOKEN
-          # and uncomment:
-          # password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
           verbose: true
 

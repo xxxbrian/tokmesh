@@ -8,7 +8,7 @@ Usage:
 Updates:
   - [workspace.package] version in root Cargo.toml
   - version fields on internal path deps (tokmesh-core / tokmesh-cli)
-  - packaging/npm/**/package.json (version + tokmesh-* optionalDependency pins)
+  - packaging/npm/tokmesh/package.json
   - packaging/pypi/pyproject.toml and src/tokmesh/__init__.py
 
 Does not create git commits or tags. Review the diff, commit, then tag vX.Y.Z.
