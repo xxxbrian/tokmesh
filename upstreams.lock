@@ -1,0 +1,31 @@
+# Tokmesh upstream baselines (reviewed tips). Not auto-merged.
+# Hard-fork reference pins: record which upstream commits we reviewed when
+# adopting code. Update this file when you intentionally re-base research
+# clones or pull a new upstream tip into consideration.
+# Format: simple key/value for humans and scripts.
+
+[tokscale]
+repo = "https://github.com/junhoyeo/tokscale"
+commit = "4b3f9bb8f58d93b9dd2a9312497630e98337b1a9"
+subject = "feat(og): brand the cards with Manrope, Pretendard, and the wordmark"
+role = "local-baseline"
+reviewed = "2026-07-29"
+
+[tokens]
+repo = "https://github.com/missuo/tokens"
+commit = "ab622cf281c25bede1642cd34bb905e0b541f7a5"
+subject = "fix(web): stop showing two different Kilo clients as one"
+role = "submit-hardening-and-parser-picks"
+reviewed = "2026-07-29"
+
+[adopted.tokens]
+bucket_tz = "pinned IANA date bucketing"
+grok_turn_completed = "sessions/grok.rs turn_completed usage path"
+scanner_retain_since = "ScanResult::retain_files_modified_since"
+auth_hardening = "poll clamps, optional status, 0600 repair"
+tokensci_protocol = "clientManifest, provenance, --replace"
+
+[kept.tokscale]
+full_tui_reports = true
+hermes_per_model = true
+tests = true
