@@ -9,6 +9,8 @@ Tokmesh is a hard fork of [tokscale](https://github.com/junhoyeo/tokscale). It k
 
 ## Install
 
+Maintainer release steps (bump, tag, binaries, registries): see [RELEASING.md](RELEASING.md).
+
 ### Cargo
 
 ```sh
