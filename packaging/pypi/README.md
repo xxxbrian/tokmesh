@@ -1,15 +1,10 @@
 # tokmesh
 
-Python wrapper for the [tokmesh](https://github.com/xxxbrian/tokmesh) CLI.
+CLI for [tokmesh](https://github.com/xxxbrian/tokmesh) — local AI coding token analytics.
 
 ```sh
 pipx install tokmesh
-# or
-uv tool install tokmesh
-# or
-pip install tokmesh
-
 tokmesh --help
 ```
 
-Platform wheels ship the same prebuilt binaries as [GitHub Releases](https://github.com/xxxbrian/tokmesh/releases).
+Also: `uv tool install tokmesh` or `pip install tokmesh`.

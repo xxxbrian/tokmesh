@@ -9,53 +9,29 @@ Tokmesh is a hard fork of [tokscale](https://github.com/junhoyeo/tokscale). It k
 
 ## Install
 
-Maintainer release steps (bump, tag, binaries, registries): see [RELEASING.md](RELEASING.md).
-
-### Cargo
+Pick one:
 
 ```sh
+# Cargo
 cargo install tokmesh --locked
-# or from git:
-cargo install --git https://github.com/xxxbrian/tokmesh --locked tokmesh
-# or, in a checkout:
+
+# npm
+npm install -g tokmesh
+
+# pipx / uv / pip
+pipx install tokmesh
+# uv tool install tokmesh
+# pip install tokmesh
+
+# mise (prebuilt binary)
+mise use -g github:xxxbrian/tokmesh
+
+# From a clone
 cargo build --release -p tokmesh
 ./target/release/tokmesh --help
 ```
 
-The installable package name is `tokmesh` (short crates.io name). Implementation lives in `tokmesh-cli`; the `tokmesh` crate is a thin wrapper that produces the same `tokmesh` binary.
-
-### npm
-
-```sh
-npm install -g tokmesh
-# or
-npx tokmesh --help
-```
-
-### PyPI
-
-```sh
-pipx install tokmesh
-# or
-uv tool install tokmesh
-# or
-pip install tokmesh
-```
-
-### mise (GitHub Releases)
-
-After a `v*` tag release exists:
-
-```sh
-mise use -g github:xxxbrian/tokmesh
-tokmesh --help
-```
-
-Release assets are named `tokmesh-{version}-{rust-target}.tar.gz` (`.zip` on Windows) with a `tokmesh` binary inside, so mise can auto-select your platform.
-
-### GitHub Releases
-
-Download the archive for your target from the [Releases](https://github.com/xxxbrian/tokmesh/releases) page, extract, and put `tokmesh` on your `PATH`.
+Prebuilt binaries are also on the [Releases](https://github.com/xxxbrian/tokmesh/releases) page: download the archive for your platform, extract, and put `tokmesh` on your `PATH`.
 
 ## Local usage
 
