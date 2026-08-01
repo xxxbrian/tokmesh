@@ -87,8 +87,8 @@ Environment overrides (optional):
 |----------|---------|
 | `TOKMESH_TOKSCALE_API_TOKEN` | tokscale.ai API token |
 | `TOKMESH_TOKENSCI_API_TOKEN` | tokens.ci API token |
-| `TOKMESH_TOKSCALE_API_URL` | Override tokscale API base (tests/mocks) |
-| `TOKMESH_TOKENSCI_API_URL` | Override tokens.ci API base (tests/mocks) |
+| `TOKMESH_TOKSCALE_API_URL` | Override tokscale API base URL |
+| `TOKMESH_TOKENSCI_API_URL` | Override tokens.ci API base URL |
 
 Submit sends daily usage aggregates and a stable device identifier. It never sends prompts, completions, file contents, or local paths.
 
