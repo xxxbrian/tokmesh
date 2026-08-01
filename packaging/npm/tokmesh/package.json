@@ -1,6 +1,6 @@
 {
   "name": "tokmesh",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local AI coding token analytics CLI and TUI",
   "repository": {
     "type": "git",
