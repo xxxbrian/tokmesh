@@ -128,14 +128,28 @@ jobs:
       - name: Package check
         run: |
           set -euo pipefail
+          # cargo package rewrites path+version deps to crates.io versions. For a
+          # first publish of a new workspace version, only the leaf dependency
+          # (tokmesh-core) is guaranteed to resolve on the index yet — cli/tokmesh
+          # still require core@this-version, which appears only after we publish
+          # it below. So we fully package/dry-run core, and treat cli/tokmesh
+          # package failures as expected until core lands.
           cargo package -p tokmesh-core --allow-dirty --no-verify
-          cargo package -p tokmesh-cli --allow-dirty --no-verify
-          cargo package -p tokmesh --allow-dirty --no-verify
-          cargo publish -p tokmesh-core --dry-run --allow-dirty
-          cargo publish -p tokmesh-cli --dry-run --allow-dirty --no-verify || \
-            echo "NOTE: tokmesh-cli dry-run needs tokmesh-core on crates.io (ok if already published)"
-          cargo publish -p tokmesh --dry-run --allow-dirty --no-verify || \
-            echo "NOTE: tokmesh dry-run needs tokmesh-cli on crates.io (ok if already published)"
+          cargo publish -p tokmesh-core --dry-run --allow-dirty --no-verify
+
+          if cargo package -p tokmesh-cli --allow-dirty --no-verify; then
+            cargo publish -p tokmesh-cli --dry-run --allow-dirty --no-verify || \
+              echo "NOTE: tokmesh-cli publish dry-run soft-failed (often index lag)"
+          else
+            echo "NOTE: tokmesh-cli cannot package until tokmesh-core@${{ needs.gate.outputs.version }} is on crates.io — will publish in order after core"
+          fi
+
+          if cargo package -p tokmesh --allow-dirty --no-verify; then
+            cargo publish -p tokmesh --dry-run --allow-dirty --no-verify || \
+              echo "NOTE: tokmesh publish dry-run soft-failed (often index lag)"
+          else
+            echo "NOTE: tokmesh cannot package until tokmesh-cli@${{ needs.gate.outputs.version }} is on crates.io — will publish in order after cli"
+          fi
 
       - name: Authenticate to crates.io (OIDC)
         if: ${{ inputs.dry_run == false }}

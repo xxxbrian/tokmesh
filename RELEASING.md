@@ -173,6 +173,9 @@ pipx install tokmesh
   that version is complete. npm and PyPI packages depend on those assets;
   yanking/replacing registry versions is painful.
 - **crates.io** cannot reuse a version number. Bump semver for every publish.
+- **crates.io workspace order:** publish `tokmesh-core`, then `tokmesh-cli`, then
+  `tokmesh`. CI packages core first; cli/tokmesh only resolve on the index after
+  their dependencies of the *same* version are already published.
 - **npm / PyPI** same: once `0.2.0` is published, the next cut is `0.2.1`+.
 - First-time local bootstrap (0.1.0) used interactive login/tokens; ongoing
   releases should use tag → Release → manual Publish registries + OIDC.
