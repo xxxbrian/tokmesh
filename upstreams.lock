@@ -7,6 +7,9 @@
 [tokscale]
 repo = "https://github.com/junhoyeo/tokscale"
 commit = "4b3f9bb8f58d93b9dd2a9312497630e98337b1a9"
+# Package version at that commit (`[workspace.package] version`). Submit to
+# tokscale.ai reports this as meta.version (cliVersion), not tokmesh's own semver.
+version = "4.7.0"
 subject = "feat(og): brand the cards with Manrope, Pretendard, and the wordmark"
 role = "local-baseline"
 reviewed = "2026-07-29"
@@ -14,6 +17,8 @@ reviewed = "2026-07-29"
 [tokens]
 repo = "https://github.com/missuo/tokens"
 commit = "ab622cf281c25bede1642cd34bb905e0b541f7a5"
+# Package version at that commit. Submit to tokens.ci reports this as meta.version.
+version = "27.0.1"
 subject = "fix(web): stop showing two different Kilo clients as one"
 role = "submit-hardening-and-parser-picks"
 reviewed = "2026-07-29"

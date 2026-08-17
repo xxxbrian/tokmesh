@@ -4492,7 +4492,7 @@ fn to_ts_token_contribution_data(
     TsTokenContributionData {
         meta: TsExportMeta {
             generated_at: graph.meta.generated_at.clone(),
-            version: graph.meta.version.clone(),
+            version: board.submit_cli_version().to_string(),
             date_range: DateRange {
                 start: graph.meta.date_range_start.clone(),
                 end: graph.meta.date_range_end.clone(),
@@ -8016,6 +8016,46 @@ mod tests {
             payload.device.as_ref().unwrap().name.as_deref(),
             Some("Test device")
         );
+        assert_eq!(
+            payload.meta.version,
+            leaderboard::TOKSCALE_UPSTREAM_CLI_VERSION
+        );
+    }
+
+    #[test]
+    fn submit_payload_uses_board_upstream_cli_version_not_graph_meta() {
+        let graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-12-31",
+            20,
+            2.50,
+            "codex",
+            "model-b",
+        )]);
+        assert_eq!(graph.meta.version, "test");
+
+        let tokscale = to_ts_token_contribution_data(
+            &graph,
+            None,
+            leaderboard::Leaderboard::Tokscale,
+            None,
+        );
+        let tokensci = to_ts_token_contribution_data(
+            &graph,
+            None,
+            leaderboard::Leaderboard::TokensCi,
+            None,
+        );
+
+        assert_eq!(
+            tokscale.meta.version,
+            leaderboard::TOKSCALE_UPSTREAM_CLI_VERSION
+        );
+        assert_eq!(
+            tokensci.meta.version,
+            leaderboard::TOKENSCI_UPSTREAM_CLI_VERSION
+        );
+        assert_ne!(tokscale.meta.version, graph.meta.version);
+        assert_ne!(tokensci.meta.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
