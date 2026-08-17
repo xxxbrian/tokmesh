@@ -3279,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "tokmesh"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "tokmesh-cli",
@@ -3287,7 +3287,7 @@ dependencies = [
 
 [[package]]
 name = "tokmesh-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ab_glyph",
  "aes",
@@ -3333,7 +3333,7 @@ dependencies = [
 
 [[package]]
 name = "tokmesh-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "bincode",
  "chrono",
