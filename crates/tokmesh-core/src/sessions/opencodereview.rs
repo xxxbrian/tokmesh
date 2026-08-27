@@ -3,20 +3,16 @@
 //! OpenCodeReview stores sessions as JSONL files under
 //! `~/.opencodereview/sessions/<encoded-repo-path>/<session-id>.jsonl`.
 
-use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms, parse_timestamp_value};
+use super::utils::{
+    back_anchor_timestamp, file_modified_timestamp_ms, for_each_json_line, parse_timestamp_value,
+};
 use super::UnifiedMessage;
 use crate::{pricing, provider_identity, TokenBreakdown};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
     let session_id = session_id_from_path(path);
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
@@ -24,15 +20,13 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
 
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let Ok(line) = line else { continue };
-
+    for_each_json_line(path, &mut |line_index, line| {
         if !line.contains("llm_response") && !line.contains("session_start") {
-            continue;
+            return;
         }
 
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
         };
 
         let record_type = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -41,21 +35,21 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             if workspace.is_none() {
                 workspace = value.get("cwd").and_then(Value::as_str).map(str::to_string);
             }
-            continue;
+            return;
         }
 
         if record_type != "llm_response" {
-            continue;
+            return;
         }
 
         let usage = match value.get("usage") {
             Some(u) => u,
-            None => continue,
+            None => return,
         };
 
         let tokens = tokens_from_usage(usage);
         if tokens.total() == 0 {
-            continue;
+            return;
         }
 
         // `explicit_timestamp` is this record's own recorded `timestamp`
@@ -86,8 +80,8 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
         // `duration_ms` is that call's elapsed time, so sessionize()'s
         // `[timestamp, timestamp + duration_ms]` span would otherwise
         // project forward past the actual completion into phantom idle time.
-        // Back-calculate the start anchor the same way used for Copilot's
-        // `endTime`-only records.
+        // Back-calculate the start anchor the same way #890 did for
+        // Copilot's `endTime`-only records.
         //
         // Only do this when `explicit_timestamp` is a real recorded end
         // timestamp: when it's absent, `recorded_timestamp` is
@@ -99,9 +93,18 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             _ => recorded_timestamp,
         };
 
-        // Timestamped duplicate rows are replayed writes of the same call and
-        // retain the historical key. Timestampless rows all share file mtime,
-        // so use their stable file line to keep distinct calls distinct.
+        // Records carrying their own `timestamp` keep the historical key:
+        // two lines agreeing on the recorded end timestamp, model and usage
+        // are a replayed write of one call, and collapsing them is deliberate.
+        //
+        // Without one, `recorded_timestamp` is the file mtime — the same value
+        // for every record in the file — so that key can no longer separate
+        // two genuinely distinct calls that happen to share a model and token
+        // counts, and silently undercounts them (#941). Fall back to the
+        // record's line number, which is derived from the file's own contents:
+        // a re-parse of an unchanged file reproduces the same keys and still
+        // dedups, while distinct records stay distinct. `duration_ms` alone
+        // would not do — it is optional, and two calls can take equally long.
         let line_discriminator = match explicit_timestamp {
             Some(_) => String::new(),
             None => format!(":line{line_index}"),
@@ -111,7 +114,7 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             tokens.input, tokens.output, tokens.cache_read, tokens.cache_write,
         );
         if !seen.insert(dedup_key.clone()) {
-            continue;
+            return;
         }
 
         let mut msg = UnifiedMessage::new(
@@ -134,7 +137,7 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
         }
 
         messages.push(msg);
-    }
+    });
 
     messages
 }
@@ -304,6 +307,10 @@ mod tests {
 
     #[test]
     fn timestampless_records_with_identical_usage_stay_distinct() {
+        // Regression (#941 finding 2): without a `timestamp` field every
+        // record in the file falls back to the same file mtime, so the
+        // session/timestamp/model/usage key could not tell two genuinely
+        // distinct calls apart and silently collapsed them into one.
         let content = format!(
             "{}\n{}\n{}\n",
             session_start("/home/user/project"),
@@ -312,14 +319,28 @@ mod tests {
         );
         let msgs = parse_events(&content);
 
-        assert_eq!(msgs.len(), 2);
-        assert_ne!(msgs[0].dedup_key, msgs[1].dedup_key);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "two distinct timestampless calls must not collapse into one"
+        );
+        assert_ne!(
+            msgs[0].dedup_key, msgs[1].dedup_key,
+            "distinct timestampless records need distinct dedup keys"
+        );
         assert_eq!(msgs[0].duration_ms, Some(1200));
         assert_eq!(msgs[1].duration_ms, Some(3400));
     }
 
     #[test]
-    fn reparsing_timestampless_records_reproduces_dedup_keys() {
+    fn reparsing_a_timestampless_file_reproduces_the_same_dedup_keys() {
+        // The discriminator must be a pure function of the file's bytes, not
+        // of parse order or wall-clock, so two parses of an unchanged file
+        // agree. Only this parser's own `seen` set reads the key today —
+        // unified_to_parsed drops the field — so this pins the property
+        // before a cross-parse consumer relies on it. Note the rest of the
+        // key still moves when the file grows: with no `timestamp` field
+        // `recorded_timestamp` is the mtime.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test-session-123.jsonl");
         std::fs::write(
@@ -333,17 +354,20 @@ mod tests {
         )
         .unwrap();
 
-        let parse_keys = || {
-            parse_opencodereview_file(&path)
-                .into_iter()
-                .map(|msg| msg.dedup_key)
-                .collect::<Vec<_>>()
-        };
-        let first = parse_keys();
-        let second = parse_keys();
+        let first: Vec<_> = parse_opencodereview_file(&path)
+            .into_iter()
+            .map(|msg| msg.dedup_key)
+            .collect();
+        let second: Vec<_> = parse_opencodereview_file(&path)
+            .into_iter()
+            .map(|msg| msg.dedup_key)
+            .collect();
 
         assert_eq!(first.len(), 2);
-        assert_eq!(first, second);
+        assert_eq!(
+            first, second,
+            "re-parsing an unchanged file must reproduce the same dedup keys"
+        );
     }
 
     #[test]
@@ -396,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_llm_response_timestamp_is_start_anchored() {
-        // An `llm_response` record's
+        // Regression (follow-up to #890): an `llm_response` record's
         // `timestamp` is written when the response is logged, i.e. the
         // call's *end*, not its start. `duration_ms` is that call's elapsed
         // time, so sessionize()'s `[timestamp, timestamp + duration_ms]`

@@ -12,9 +12,15 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("k2-p6", "kimi-k2.6");
     m.insert("kimi-k2p6", "kimi-k2.6");
     m.insert("kimi-k2.5-thinking", "kimi-k2-thinking");
-    m.insert("kimi-for-coding", "kimi-k2.5");
+    m.insert("kimi-for-coding", "kimi-k2.7-code");
     m.insert("kimi-for-coding-highspeed", "kimi-k2.7-code-highspeed");
     m.insert("k3", "kimi-k3");
+    m.insert("k3-256k", "kimi-k3");
+    // Kimi Work (desktop agent mode) reports its own ids.
+    m.insert("k2d6-agent", "kimi-k2.6");
+    m.insert("k3-agent", "kimi-k3");
+    m.insert("k3-agent-swarm", "kimi-k3");
+    m.insert("minimax-m3", "minimax/MiniMax-M3");
 
     m.insert("model_placeholder_m26", "claude-opus-4-6");
     m.insert("model_placeholder_m35", "claude-sonnet-4-6");

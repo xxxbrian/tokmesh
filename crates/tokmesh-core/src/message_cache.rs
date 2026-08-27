@@ -823,10 +823,10 @@ fn parser_version(client: ClientId) -> u32 {
         // shared identity, and a valid span_id alone (no trace_id) is now a
         // stable dedup key instead of falling through to the line-index key.
         // v7->v8: stabilize duplicate agent attribution and partial timing boundaries.
-        ClientId::Copilot => 8,
+        ClientId::Copilot => 9,
         // Pi subagent sessions now derive agent attribution from session_info
         // names; version-1 caches carry those messages without agent metadata.
-        ClientId::Pi => 2,
+        ClientId::Pi => 3,
         // Devin CLI v1 could stop at a malformed chat_message. v2->v3:
         // message timestamp is now back-calculated to the turn start
         // (created_at - total_time_ms) instead of the recorded (end-anchored)
@@ -835,7 +835,9 @@ fn parser_version(client: ClientId) -> u32 {
         // Desktop v1 parsed a non-ACP shape and did not track its CLI title
         // lookup; its timestamp handling is unaffected by this change.
         ClientId::DevinDesktop => 2,
-        ClientId::Claude => 2,
+        // v2->v3: drop Claude Code `<synthetic>` placeholder rows and any
+        // tool-result usage that inherited that unpriceable model.
+        ClientId::Claude => 3,
         // Junie's usage-event timestamp is now back-calculated to the call
         // start (timestampMs - usage.time) instead of the recorded
         // (end-anchored) timestampMs.
@@ -851,7 +853,7 @@ fn parser_version(client: ClientId) -> u32 {
         // opencodereview's llm_response timestamp is now back-calculated to
         // the call start (timestamp - duration_ms) instead of the recorded
         // (end-anchored) timestamp.
-        ClientId::OpenCodeReview => 3,
+        ClientId::OpenCodeReview => 4,
         // v2->v3: turn_completed model usage now excludes reasoning from raw
         // output, completed legacy fallback turns are retained, and signals
         // reconciliation stays anchored to the earliest session activity.
@@ -869,6 +871,19 @@ fn parser_version(client: ClientId) -> u32 {
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
         ClientId::Hermes => 2,
+        // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
+        // deduplication keys.
+        ClientId::Kimchi => 2,
+        // Prime Agent accounting/lineage recovery versions.
+        ClientId::PrimeAgent => 4,
+        // Reasonix fingerprint + family-inference recovery versions.
+        ClientId::Reasonix => 4,
+        // DSH summary-event + fork-dedup versions.
+        ClientId::Dsh => 3,
+        // fx usage-v2 optional total_cost.
+        ClientId::Fx => 2,
+        // omp shares the pi-format parser (keep in lockstep with Pi bumps).
+        ClientId::Omp => 1,
         _ => 1,
     }
 }
@@ -2070,12 +2085,12 @@ mod tests {
     #[test]
     fn test_codex_duration_parser_version_invalidates_v4_entries() {
         assert_eq!(parser_version(ClientId::Codex), 6);
-        assert_eq!(parser_version(ClientId::Claude), 2);
+        assert_eq!(parser_version(ClientId::Claude), 3);
     }
 
     #[test]
     fn test_copilot_duplicate_metadata_parser_version_invalidates_v7_entries() {
-        assert_eq!(parser_version(ClientId::Copilot), 8);
+        assert_eq!(parser_version(ClientId::Copilot), 9);
     }
 
     #[test]
@@ -2096,7 +2111,7 @@ mod tests {
         assert_eq!(parser_version(ClientId::Jcode), 7);
         assert_eq!(parser_version(ClientId::DevinCli), 3);
         assert_eq!(parser_version(ClientId::Zcode), 3);
-        assert_eq!(parser_version(ClientId::OpenCodeReview), 3);
+        assert_eq!(parser_version(ClientId::OpenCodeReview), 4);
         assert_eq!(parser_version(ClientId::Kiro), 2);
     }
 

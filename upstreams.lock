@@ -6,22 +6,26 @@
 
 [tokscale]
 repo = "https://github.com/junhoyeo/tokscale"
-commit = "4b3f9bb8f58d93b9dd2a9312497630e98337b1a9"
+commit = "e746d2b17d8af8ace9ee65ca5c6b02191c94e02a"
 # Package version at that commit (`[workspace.package] version`). Submit to
 # tokscale.ai reports this as meta.version (cliVersion), not tokmesh's own semver.
+# Pin is the newest IN-SCOPE commit actually used (dsh bound). HEAD 62ca1eb is
+# TUI/branding/version-bump 4.14.0 and is out of scope — do not report 4.14.0.
 version = "4.7.0"
-subject = "feat(og): brand the cards with Manrope, Pretendard, and the wordmark"
+subject = "fix(dsh): bound transcript reads and zstd expansion"
 role = "local-baseline"
-reviewed = "2026-07-29"
+reviewed = "2026-08-27"
 
 [tokens]
 repo = "https://github.com/missuo/tokens"
-commit = "ab622cf281c25bede1642cd34bb905e0b541f7a5"
+commit = "42667fd42eddd79d04db569961f61f87922d3c67"
 # Package version at that commit. Submit to tokens.ci reports this as meta.version.
+# Pin is the newest IN-SCOPE commit actually used (fx merge). HEAD 75aba19 is
+# the Grok unified revert (B5, out of scope).
 version = "27.0.1"
-subject = "fix(web): stop showing two different Kilo clients as one"
+subject = "Merge pull request #62 from thedavidweng/feat/fx"
 role = "submit-hardening-and-parser-picks"
-reviewed = "2026-07-29"
+reviewed = "2026-08-27"
 
 [adopted.tokens]
 bucket_tz = "pinned IANA date bucketing"
@@ -29,8 +33,15 @@ grok_turn_completed = "sessions/grok.rs turn_completed usage path"
 scanner_retain_since = "ScanResult::retain_files_modified_since"
 auth_hardening = "poll clamps, optional status, 0600 repair"
 tokensci_protocol = "clientManifest, provenance, --replace"
+cline_cli_parser = "VS Code + CLI Cline (do not dual-register tokscale Cline)"
+reasonix_stats_jsonl = "Reasonix stats JSONL parser"
+freebuff_parser = "Freebuff/manicode channel parser"
+fx_usage_v2 = "fx usage-v2 parser (tokscale's three fx fixes layered on top)"
 
 [kept.tokscale]
 full_tui_reports = true
 hermes_per_model = true
 tests = true
+opencode_fast_grok_build_pricing = true
+rustls_tls = true
+compact_client_column = true
