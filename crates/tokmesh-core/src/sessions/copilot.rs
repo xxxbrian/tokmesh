@@ -4,38 +4,22 @@
 //! Copilot Chat monitoring. Chat spans and inference log records are preferred;
 //! aggregate agent records are only used as a fallback to avoid double counting.
 
-use super::utils::file_modified_timestamp_ms;
+use super::utils::{file_modified_timestamp_ms, for_each_json_line};
 use super::UnifiedMessage;
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 pub fn parse_copilot_file(path: &Path) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Vec::new(),
-    };
-
     let fallback_timestamp = file_modified_timestamp_ms(path);
     let mut records = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
+    for_each_json_line(path, &mut |_index, trimmed| {
         if let Ok(record) = serde_json::from_str::<Value>(trimmed) {
             records.push(record);
         }
-    }
+    });
 
     let trace_contexts = collect_trace_contexts(&records);
     let candidates: Vec<CopilotUsageCandidate> = records
@@ -1928,7 +1912,7 @@ mod tests {
     #[test]
     fn adversarial_spanid_only_duplicates_do_merge() {
         // Duplicate exporter snapshots of the SAME span (same spanId) that lack
-        // a traceId. These should merge into one message,
+        // a traceId. Per the #939 intent these should merge into one message,
         // but the fallback dedup key previously ignored span_id and appended
         // the line index, so they stayed distinct -> double count.
         let content = concat!(

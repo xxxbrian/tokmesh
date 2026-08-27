@@ -4537,6 +4537,83 @@ mod tests {
         assert!(result.get(ClientId::Claude).is_empty());
     }
 
+    /// Kimi Work ships as a desktop-only build; a Linux home must not cause a
+    /// similarly named application-data tree to be scanned as Kimi Work.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_all_clients_kimi_work_is_not_discovered_on_linux() {
+        let dir = TempDir::new().unwrap();
+        let wire = dir.path().join(
+            "Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/wd_workspace_c107cac82a87/conv-linux-session/agents/main/wire.jsonl",
+        );
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        File::create(&wire).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+
+        assert!(result.get(ClientId::Kimi).is_empty());
+    }
+
+    /// Kimi Work uses the same wire protocol under the desktop app-data tree,
+    /// with both conversation and title-generation sessions preserved as
+    /// separate files.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn test_scan_all_clients_kimi_work_discovers_conv_and_ctitle_sessions() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let conv = kimi_work_test_wire(home, "conv-4e171339d10b9954d0fc24da");
+        let ctitle = kimi_work_test_wire(home, "ctitle-01a01fe5-e170-765c-a1b3-c4daad0cda13");
+        let wire = concat!(
+            "{\"type\":\"llm.request\",\"model\":\"k2d6-agent\",\"time\":1780319377000}\n",
+            "{\"type\":\"usage.record\",\"model\":\"k2d6-agent\",\"usage\":{\"inputOther\":100,\"output\":10,\"inputCacheRead\":0,\"inputCacheCreation\":0},\"usageScope\":\"turn\",\"time\":1780319377010}\n"
+        );
+        for path in [&conv, &ctitle] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, wire).unwrap();
+        }
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        let kimi_files = result.get(ClientId::Kimi);
+        assert_eq!(kimi_files.len(), 2);
+        assert!(kimi_files.contains(&conv));
+        assert!(kimi_files.contains(&ctitle));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn kimi_work_test_wire(home: &std::path::Path, session_id: &str) -> PathBuf {
+        let work_root = if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support")
+        } else {
+            home.join("AppData").join("Roaming")
+        };
+        kimi_work_wire_from_root(&work_root, session_id)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn kimi_work_wire_from_root(root: &std::path::Path, session_id: &str) -> PathBuf {
+        root.join("kimi-desktop")
+            .join("daimon-share")
+            .join("daimon")
+            .join("runtime")
+            .join("kimi-code")
+            .join("home")
+            .join("sessions")
+            .join("wd_workspace_c107cac82a87")
+            .join(session_id)
+            .join("agents")
+            .join("main")
+            .join("wire.jsonl")
+    }
+
     #[test]
     fn test_scan_all_clients_grok() {
         let dir = TempDir::new().unwrap();

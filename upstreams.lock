@@ -6,24 +6,23 @@
 
 [tokscale]
 repo = "https://github.com/junhoyeo/tokscale"
-commit = "e746d2b17d8af8ace9ee65ca5c6b02191c94e02a"
+commit = "62ca1eb1677556972ba963fdfa3a41ab23c1eb4b"
 # Package version at that commit (`[workspace.package] version`). Submit to
 # tokscale.ai reports this as meta.version (cliVersion), not tokmesh's own semver.
-# Pin is the newest IN-SCOPE commit actually used (dsh bound). HEAD 62ca1eb is
-# TUI/branding/version-bump 4.14.0 and is out of scope — do not report 4.14.0.
+# Files were copied from this HEAD; keep reporting lock version 4.7.0 (do not
+# report tokscale 4.14.0 / website / OG / branding).
 version = "4.7.0"
-subject = "fix(dsh): bound transcript reads and zstd expansion"
+subject = "style(tui): collapse a nested condition rustfmt and clippy disagreed over"
 role = "local-baseline"
 reviewed = "2026-08-27"
 
 [tokens]
 repo = "https://github.com/missuo/tokens"
-commit = "42667fd42eddd79d04db569961f61f87922d3c67"
+commit = "75aba190695c9de5f2695d9baba6afd3c8cb63f8"
 # Package version at that commit. Submit to tokens.ci reports this as meta.version.
-# Pin is the newest IN-SCOPE commit actually used (fx merge). HEAD 75aba19 is
-# the Grok unified revert (B5, out of scope).
+# Files were copied from this HEAD (Grok unified dual-write itself is skipped).
 version = "27.0.1"
-subject = "Merge pull request #62 from thedavidweng/feat/fx"
+subject = "Revert Merge pull request #56 from thedavidweng/fix/grok-unified-log"
 role = "submit-hardening-and-parser-picks"
 reviewed = "2026-08-27"
 
@@ -37,6 +36,20 @@ cline_cli_parser = "VS Code + CLI Cline (do not dual-register tokscale Cline)"
 reasonix_stats_jsonl = "Reasonix stats JSONL parser"
 freebuff_parser = "Freebuff/manicode channel parser"
 fx_usage_v2 = "fx usage-v2 parser (tokscale's three fx fixes layered on top)"
+kimi_blank_env = "KIMI_CODE_HOME trim-empty fallback + kimi-work roots via kimi-code parser"
+
+[adopted.tokscale]
+daily_2026_08_27_clients = "11 new ClientIds + scanner special cases (senpi extra roots, prime-agent artifacts, cherry v2, freebuff/manicode share, mcode headless, kimi-work roots)"
+daily_2026_08_27_cli = "ClientFilter variants including NineRouter->Gjc, TUI display names"
+daily_2026_08_27_pricing_aliases = "kimi-for-coding, k2d6-agent/k3-agent, minimax-m3, daybreak-blue, claude-opus-4-0/claude-opus-41"
+daily_2026_08_27_copilot = "copilot.rs for_each_json_line + desktop/vscode full chain"
+daily_2026_08_27_hang = "lossy_lines / for_each_json_line / sqlite_for_each_row_on (kimi, copilot, synthetic, grok)"
+
+[kept.tokmesh]
+opencode_fast = "OpenCode gpt-*-fast identity (parser_version OpenCode=2)"
+grok_build = "Grok -build model identity; grok parser stays updates.jsonl (no unified dual-source)"
+rustls = "reqwest rustls-tls, no native-tls"
+hermes_per_model = true
 
 [kept.tokscale]
 full_tui_reports = true
