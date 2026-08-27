@@ -8079,18 +8079,10 @@ mod tests {
         )]);
         assert_eq!(graph.meta.version, "test");
 
-        let tokscale = to_ts_token_contribution_data(
-            &graph,
-            None,
-            leaderboard::Leaderboard::Tokscale,
-            None,
-        );
-        let tokensci = to_ts_token_contribution_data(
-            &graph,
-            None,
-            leaderboard::Leaderboard::TokensCi,
-            None,
-        );
+        let tokscale =
+            to_ts_token_contribution_data(&graph, None, leaderboard::Leaderboard::Tokscale, None);
+        let tokensci =
+            to_ts_token_contribution_data(&graph, None, leaderboard::Leaderboard::TokensCi, None);
 
         assert_eq!(
             tokscale.meta.version,
