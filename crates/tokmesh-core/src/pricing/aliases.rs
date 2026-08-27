@@ -95,6 +95,21 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("claude-opus-4.6", "claude-opus-4-6");
     m.insert("claude-sonnet-4.6", "claude-sonnet-4-6");
     m.insert("claude-haiku-4.6", "claude-haiku-4-6");
+    // Anthropic's "-0" suffix is their documented moving alias for the latest
+    // snapshot of a model line (claude-opus-4-0 -> newest Opus 4). Datasets
+    // publish the dated key instead, so the alias form resolved to nothing and
+    // real first-party usage was excluded from submission as unpriced.
+    m.insert("claude-opus-4-0", "claude-opus-4");
+    m.insert("claude-sonnet-4-0", "claude-sonnet-4");
+    // GitHub Copilot reports Claude 4.1 without the separator. Copilot usage is
+    // priced at the underlying model's rates (its own $0.00 subscription rows
+    // are filtered out by EXCLUDED_LITELLM_PREFIXES), so this must resolve the
+    // same way github_copilot/gpt-4o already resolves to gpt-4o.
+    // Deliberately opus-only: `claude-sonnet-4-1` currently resolves to
+    // `databricks/databricks-claude-sonnet-4-1` via a cross-vendor fuzzy match
+    // (#1062), so aliasing the Copilot spelling onto it would route Sonnet 4.1
+    // usage to Databricks rates. Add it once #1062 makes that target safe.
+    m.insert("claude-opus-41", "claude-opus-4-1");
     m.insert("anthropic/claude-4-5-opus", "claude-opus-4-5");
     m.insert("anthropic/claude-4-5-sonnet", "claude-sonnet-4-5");
     m.insert("anthropic/claude-4-5-haiku", "claude-haiku-4-5");
@@ -108,6 +123,17 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("gemini-3-flash", "gemini-3-flash-preview");
     m.insert("gemini-3-flash-c", "gemini-3-flash-preview");
     m.insert("gemini-3-flash-a", "gemini-3.5-flash-high");
+    // OpenAI documents the API spelling below as a moving alias for
+    // `gpt-5.6-sol`; Codex records the same alias with its `gpt-` prefix.
+    // Keep the API, Codex, and provider-qualified spellings pinned to the
+    // currently documented target so the upstream GPT-5.6 Sol row supplies
+    // all token-bucket rates. The qualified form must be explicit because
+    // provider-prefix stripping does not run alias resolution a second time.
+    m.insert("daybreak-blue-latest", "gpt-5.6-sol");
+    m.insert("gpt-daybreak-blue-latest", "gpt-5.6-sol");
+    m.insert("openai/gpt-daybreak-blue-latest", "gpt-5.6-sol");
+    m.insert("openai/daybreak-blue-latest", "gpt-5.6-sol");
+
     m.insert("grok-composer-2.5", "composer-2.5");
     m.insert("grok-composer-2.5-fast", "composer-2.5-fast");
 
@@ -241,5 +267,35 @@ mod tests {
 
         assert_eq!(m187_result.matched_key, "google/gemini-3.5-flash");
         assert_eq!(m20_result.matched_key, "google/gemini-3.5-flash");
+    }
+
+    #[test]
+    fn resolves_openai_daybreak_blue_aliases_to_gpt_5_6_sol() {
+        assert_eq!(resolve_alias("daybreak-blue-latest"), Some("gpt-5.6-sol"));
+        assert_eq!(
+            resolve_alias("gpt-daybreak-blue-latest"),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            resolve_alias("GPT-DAYBREAK-BLUE-LATEST"),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            resolve_alias("openai/daybreak-blue-latest"),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            resolve_alias("openai/gpt-daybreak-blue-latest"),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn anthropic_moving_aliases_and_copilot_spelling_resolve() {
+        assert_eq!(resolve_alias("claude-opus-4-0"), Some("claude-opus-4"));
+        assert_eq!(resolve_alias("claude-sonnet-4-0"), Some("claude-sonnet-4"));
+        assert_eq!(resolve_alias("claude-opus-41"), Some("claude-opus-4-1"));
+        assert_eq!(resolve_alias("Claude-Opus-4-0"), Some("claude-opus-4"));
+        assert_eq!(resolve_alias("claude-sonnet-41"), None);
     }
 }

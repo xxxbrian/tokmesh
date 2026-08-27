@@ -8,12 +8,11 @@
 //! ~/.kimi-code/sessions/[WORKSPACE]/[SESSION]/agents/[AGENT]/wire.jsonl
 //!   Token data comes from usage.record lines.
 
-use super::utils::file_modified_timestamp_ms;
+use super::utils::{file_modified_timestamp_ms, for_each_json_line};
 use super::UnifiedMessage;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Top-level wire.jsonl line: either metadata or a timestamped message
@@ -174,33 +173,17 @@ struct KimiCodeWireLine {
 
 /// Parse a Kimi Code wire.jsonl file.
 pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
     let session_id = extract_session_id_from_kimi_code_path(path);
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
-    let reader = BufReader::new(file);
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let mut latest_request_model: Option<String> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
+    for_each_json_line(path, &mut |_index, trimmed| {
         let mut bytes = trimmed.as_bytes().to_vec();
         let wire_line = match simd_json::from_slice::<KimiCodeWireLine>(&mut bytes) {
             Ok(wl) => wl,
-            Err(_) => continue,
+            Err(_) => return,
         };
 
         // usage.record can contain only a symbolic config reference, while the
@@ -213,14 +196,14 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             {
                 latest_request_model = Some(model);
             }
-            continue;
+            return;
         }
 
         // Only process usage.record lines.
         // step.end also carries usage, but it duplicates the same usage.record
         // that was emitted in the same turn, so we ignore it to avoid double counting.
         if wire_line.line_type != "usage.record" {
-            continue;
+            return;
         }
 
         // Only count turn-scoped usage. kimi-code tags every usage.record with
@@ -229,12 +212,12 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
         // own tooling treats a missing usageScope as session-scoped, so require
         // an explicit "turn" to avoid counting aggregate records.
         if wire_line.usage_scope.as_deref() != Some("turn") {
-            continue;
+            return;
         }
 
         // Skip entries with zero tokens
         let Some(tokens) = wire_line.usage.as_ref().and_then(TokenUsage::to_breakdown) else {
-            continue;
+            return;
         };
 
         let model = wire_line
@@ -244,9 +227,12 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             .or_else(|| latest_request_model.clone())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        // `time` is Unix milliseconds, so only positivity is checked here.
-        // Rescaling a corrupt small value as seconds would invent a plausible
-        // timestamp; the file mtime is the honest fallback.
+        // `time` is Unix milliseconds, so only positivity is checked here —
+        // deliberately not routed through `parse_timestamp_value`, whose
+        // seconds-vs-milliseconds heuristic would rescale anything below 1e12.
+        // This field is never seconds, so rescaling would invent a plausible
+        // instant for a value that is simply corrupt; the mtime fallback says
+        // "unknown" instead.
         let timestamp_ms = wire_line
             .time
             .filter(|ms| *ms > 0)
@@ -261,71 +247,58 @@ pub fn parse_kimi_code_file(path: &Path) -> Vec<UnifiedMessage> {
             tokens,
             0.0,
         ));
-    }
+    });
 
     messages
 }
 
 /// Parse a Kimi CLI wire.jsonl file
 pub fn parse_kimi_file(path: &Path) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
     let model = read_model_from_config(path);
     let session_id = extract_session_id(path);
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
-    let reader = BufReader::new(file);
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let mut timestamp_sources: Vec<TimestampSource> = Vec::new();
     let mut keyed_indices: HashMap<String, usize> = HashMap::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
+    for_each_json_line(path, &mut |_index, trimmed| {
         let mut bytes = trimmed.as_bytes().to_vec();
         let wire_line = match simd_json::from_slice::<WireLine>(&mut bytes) {
             Ok(wl) => wl,
-            Err(_) => continue,
+            Err(_) => return,
         };
 
         // Skip metadata lines (first line: {"type": "metadata", ...})
         if wire_line.line_type.as_deref() == Some("metadata") {
-            continue;
+            return;
         }
 
         let message = match wire_line.message {
             Some(m) => m,
-            None => continue,
+            None => return,
         };
 
         // Only process StatusUpdate messages
         if message.msg_type != "StatusUpdate" {
-            continue;
+            return;
         }
 
         let payload = match message.payload {
             Some(p) => p,
-            None => continue,
+            None => return,
         };
 
         let token_usage = match payload.token_usage {
             Some(u) => u,
-            None => continue,
+            None => return,
         };
 
-        // Convert Unix seconds to milliseconds, falling back to file mtime for
-        // missing or non-positive wire values.
+        // Convert Unix seconds (float) to milliseconds, falling back to file
+        // mtime when the wire value is missing or does not convert to a
+        // positive instant. A corrupt `{"timestamp": -1.5}` would otherwise
+        // anchor the message in a pre-epoch daily bucket; the float->int cast
+        // also collapses NaN to 0, so the same check catches that.
         let (timestamp_ms, timestamp_source) = match wire_line
             .timestamp
             .map(|ts| (ts * 1000.0) as i64)
@@ -337,7 +310,7 @@ pub fn parse_kimi_file(path: &Path) -> Vec<UnifiedMessage> {
 
         // Skip entries with zero tokens
         let Some(tokens) = token_usage.to_breakdown() else {
-            continue;
+            return;
         };
 
         let dedup_key = payload.message_id;
@@ -359,7 +332,7 @@ pub fn parse_kimi_file(path: &Path) -> Vec<UnifiedMessage> {
             message,
             timestamp_source,
         );
-    }
+    });
 
     messages
 }
@@ -372,6 +345,9 @@ fn exact_token_total(tokens: &TokenBreakdown) -> i128 {
         + i128::from(tokens.reasoning)
 }
 
+/// Where a StatusUpdate's anchor came from. The mtime fallback is a guess for a
+/// line whose own timestamp was unusable, so it ranks below a real wire value
+/// when duplicates are compared.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TimestampSource {
     Wire,
@@ -391,8 +367,10 @@ fn should_replace_status_update(
         return candidate_total > existing_total;
     }
 
-    // File mtime is only a fallback and must not outrank a real wire anchor
-    // merely because it is newer than every record in the file.
+    // Totals tie, so the anchor decides. Compare provenance before the value:
+    // mtime is >= every real timestamp in a file still being written, so a
+    // corrupt duplicate that fell back to it would otherwise outrank the good
+    // line it duplicates and move the message off its true day.
     if existing_source != candidate_source {
         return candidate_source == TimestampSource::Wire;
     }
@@ -646,6 +624,9 @@ mod tests {
         let messages = parse_kimi_file(file.path());
 
         assert_eq!(messages.len(), 3);
+        // -1.5s would otherwise become -1500ms and bucket into 1969-12-31 (UTC;
+        // the exact pre-epoch day depends on the local zone, the mis-dating
+        // does not).
         assert_eq!(messages[0].tokens.input, 10);
         assert_eq!(messages[0].timestamp, mtime);
         assert_eq!(messages[1].tokens.input, 20);
@@ -655,21 +636,35 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kimi_wire_timestamp_wins_tied_dedup_in_both_orders() {
-        for content in [
-            r#"{"type": "metadata", "protocol_version": "1.3"}
+    fn test_parse_kimi_mtime_fallback_does_not_outrank_a_real_timestamp() {
+        // Same message_id, same totals, second line's timestamp unusable. The
+        // fallback lands on mtime, which is newer than every real timestamp in
+        // a live session file, so an untied comparison would let the corrupt
+        // line's anchor replace the good one.
+        let content = r#"{"type": "metadata", "protocol_version": "1.3"}
 {"timestamp": 1770983426.420942, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}
-{"timestamp": -1, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}"#,
-            r#"{"type": "metadata", "protocol_version": "1.3"}
-{"timestamp": -1, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}
-{"timestamp": 1770983426.420942, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}"#,
-        ] {
-            let file = create_test_file(content);
-            let messages = parse_kimi_file(file.path());
+{"timestamp": -1, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}"#;
+        let file = create_test_file(content);
 
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].timestamp, 1770983426420);
-        }
+        let messages = parse_kimi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1770983426420);
+    }
+
+    #[test]
+    fn test_parse_kimi_real_timestamp_still_wins_a_tie_over_mtime_fallback() {
+        // Mirror of the above with the corrupt line first, so the good anchor
+        // arrives as the candidate rather than the incumbent.
+        let content = r#"{"type": "metadata", "protocol_version": "1.3"}
+{"timestamp": -1, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}
+{"timestamp": 1770983426.420942, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 100, "output": 10, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "msg-dup"}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_kimi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1770983426420);
     }
 
     #[test]
