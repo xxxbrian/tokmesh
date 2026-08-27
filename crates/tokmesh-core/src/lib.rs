@@ -259,6 +259,18 @@ pub struct TokenBreakdown {
 }
 
 impl TokenBreakdown {
+    /// Add every token bucket from `other`, saturating each field independently.
+    ///
+    /// Use this for whole-breakdown aggregation so adding a new bucket cannot
+    /// silently leave one hand-written accumulation site incomplete.
+    pub fn add_assign_saturating(&mut self, other: &Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.reasoning = self.reasoning.saturating_add(other.reasoning);
+    }
+
     pub fn total(&self) -> i64 {
         // saturating so clamped (i64::MAX) buckets from a corrupt source can't
         // overflow the sum.
@@ -267,6 +279,12 @@ impl TokenBreakdown {
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
             .saturating_add(self.reasoning)
+    }
+}
+
+impl std::ops::AddAssign<&TokenBreakdown> for TokenBreakdown {
+    fn add_assign(&mut self, other: &TokenBreakdown) {
+        self.add_assign_saturating(other);
     }
 }
 
@@ -1747,6 +1765,227 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         })
         .collect();
     for outcome in cline_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Senpi)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Senpi),
+                path,
+                &source_cache,
+                pricing,
+                sessions::senpi::parse_senpi_file,
+            )
+        })
+        .collect();
+    for outcome in senpi_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let augment_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Augment)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Augment),
+                path,
+                &source_cache,
+                pricing,
+                sessions::augment::parse_augment_file,
+            )
+        })
+        .collect();
+    for outcome in augment_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Kimchi),
+                path,
+                &source_cache,
+                pricing,
+                sessions::kimchi::parse_kimchi_file,
+            )
+        })
+        .collect();
+    for outcome in kimchi_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let reasonix_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Reasonix),
+                path,
+                &source_cache,
+                pricing,
+                sessions::reasonix::parse_reasonix_file,
+            )
+        })
+        .collect();
+    for outcome in reasonix_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let prime_agent_files: Vec<(
+        Vec<UnifiedMessage>,
+        sessions::prime_agent::PrimeFileAccounting,
+    )> = scan_result
+        .get(ClientId::PrimeAgent)
+        .par_iter()
+        .map(|path| sessions::prime_agent::parse_prime_agent_file_with_accounting(path))
+        .collect();
+    let mut prime_agent_messages = Vec::new();
+    let mut prime_agent_accounting = Vec::new();
+    for (file_messages, file_accounting) in prime_agent_files {
+        prime_agent_messages.extend(file_messages);
+        prime_agent_accounting.push(file_accounting);
+    }
+    let mut prime_agent_messages = sessions::prime_agent::reconcile_prime_agent_messages(
+        prime_agent_messages,
+        &prime_agent_accounting,
+    );
+    apply_pricing_to_messages(&mut prime_agent_messages, pricing);
+    all_messages.extend(prime_agent_messages);
+
+    let freebuff_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Freebuff)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Freebuff),
+                path,
+                &source_cache,
+                pricing,
+                sessions::freebuff::parse_freebuff_file,
+            )
+        })
+        .collect();
+    for outcome in freebuff_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let cherrystudio_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::CherryStudio)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::CherryStudio),
+                path,
+                &source_cache,
+                pricing,
+                sessions::cherrystudio::parse_cherrystudio_file,
+            )
+        })
+        .collect();
+    for outcome in cherrystudio_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let dsh_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Dsh)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Dsh),
+                path,
+                &source_cache,
+                pricing,
+                sessions::dsh::parse_dsh_file,
+            )
+        })
+        .collect();
+    for outcome in dsh_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let mcode_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Mcode)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Mcode),
+                path,
+                &source_cache,
+                pricing,
+                sessions::mcode::parse_mcode_file,
+            )
+        })
+        .collect();
+    for outcome in mcode_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let fx_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Fx)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Fx),
+                path,
+                &source_cache,
+                pricing,
+                sessions::fx::parse_fx_file,
+            )
+        })
+        .collect();
+    for outcome in fx_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let omp_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Omp)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Omp),
+                path,
+                &source_cache,
+                pricing,
+                sessions::omp::parse_omp_file,
+            )
+        })
+        .collect();
+    for outcome in omp_outcomes {
         all_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
@@ -3316,6 +3555,172 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let cline_count = summed_parsed_message_count(&cline_msgs);
     counts.set(ClientId::Cline, cline_count);
     messages.extend(cline_msgs);
+
+    let senpi_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Senpi)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::senpi::parse_senpi_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let senpi_count = summed_parsed_message_count(&senpi_msgs);
+    counts.set(ClientId::Senpi, senpi_count);
+    messages.extend(senpi_msgs);
+
+    let augment_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Augment)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::augment::parse_augment_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let augment_count = summed_parsed_message_count(&augment_msgs);
+    counts.set(ClientId::Augment, augment_count);
+    messages.extend(augment_msgs);
+
+    let kimchi_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::kimchi::parse_kimchi_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let kimchi_count = summed_parsed_message_count(&kimchi_msgs);
+    counts.set(ClientId::Kimchi, kimchi_count);
+    messages.extend(kimchi_msgs);
+
+    let reasonix_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::reasonix::parse_reasonix_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let reasonix_count = summed_parsed_message_count(&reasonix_msgs);
+    counts.set(ClientId::Reasonix, reasonix_count);
+    messages.extend(reasonix_msgs);
+
+    let prime_agent_files: Vec<(
+        Vec<UnifiedMessage>,
+        sessions::prime_agent::PrimeFileAccounting,
+    )> = scan_result
+        .get(ClientId::PrimeAgent)
+        .par_iter()
+        .map(|path| sessions::prime_agent::parse_prime_agent_file_with_accounting(path))
+        .collect();
+    let mut prime_agent_msgs_raw = Vec::new();
+    let mut prime_agent_accounting = Vec::new();
+    for (file_messages, file_accounting) in prime_agent_files {
+        prime_agent_msgs_raw.extend(file_messages);
+        prime_agent_accounting.push(file_accounting);
+    }
+    let prime_agent_msgs: Vec<ParsedMessage> =
+        sessions::prime_agent::reconcile_prime_agent_messages(
+            prime_agent_msgs_raw,
+            &prime_agent_accounting,
+        )
+        .into_iter()
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let prime_agent_count = summed_parsed_message_count(&prime_agent_msgs);
+    counts.set(ClientId::PrimeAgent, prime_agent_count);
+    messages.extend(prime_agent_msgs);
+
+    let freebuff_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Freebuff)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::freebuff::parse_freebuff_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let freebuff_count = summed_parsed_message_count(&freebuff_msgs);
+    counts.set(ClientId::Freebuff, freebuff_count);
+    messages.extend(freebuff_msgs);
+
+    let cherrystudio_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::CherryStudio)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::cherrystudio::parse_cherrystudio_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let cherrystudio_count = summed_parsed_message_count(&cherrystudio_msgs);
+    counts.set(ClientId::CherryStudio, cherrystudio_count);
+    messages.extend(cherrystudio_msgs);
+
+    let dsh_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Dsh)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::dsh::parse_dsh_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let dsh_count = summed_parsed_message_count(&dsh_msgs);
+    counts.set(ClientId::Dsh, dsh_count);
+    messages.extend(dsh_msgs);
+
+    let mcode_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Mcode)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::mcode::parse_mcode_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mcode_count = summed_parsed_message_count(&mcode_msgs);
+    counts.set(ClientId::Mcode, mcode_count);
+    messages.extend(mcode_msgs);
+
+    let fx_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Fx)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::fx::parse_fx_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let fx_count = summed_parsed_message_count(&fx_msgs);
+    counts.set(ClientId::Fx, fx_count);
+    messages.extend(fx_msgs);
+
+    let omp_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Omp)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::omp::parse_omp_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let omp_count = summed_parsed_message_count(&omp_msgs);
+    counts.set(ClientId::Omp, omp_count);
+    messages.extend(omp_msgs);
 
     let mux_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mux)

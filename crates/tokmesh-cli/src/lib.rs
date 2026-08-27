@@ -983,6 +983,19 @@ pub enum ClientFilter {
     DevinCli,
     #[value(name = "devin-desktop")]
     DevinDesktop,
+    Senpi,
+    #[value(alias = "auggie")]
+    Augment,
+    Kimchi,
+    Reasonix,
+    #[value(name = "prime-agent")]
+    PrimeAgent,
+    Freebuff,
+    Cherrystudio,
+    Dsh,
+    Mcode,
+    Fx,
+    Omp,
     Synthetic,
 }
 
@@ -1032,6 +1045,17 @@ impl ClientFilter {
             Self::Workbuddy => "workbuddy",
             Self::DevinCli => "devin-cli",
             Self::DevinDesktop => "devin-desktop",
+            Self::Senpi => "senpi",
+            Self::Augment => "augment",
+            Self::Kimchi => "kimchi",
+            Self::Reasonix => "reasonix",
+            Self::PrimeAgent => "prime-agent",
+            Self::Freebuff => "freebuff",
+            Self::Cherrystudio => "cherrystudio",
+            Self::Dsh => "dsh",
+            Self::Mcode => "mcode",
+            Self::Fx => "fx",
+            Self::Omp => "omp",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1084,6 +1108,17 @@ impl ClientFilter {
             Self::Workbuddy => Some(ClientId::WorkBuddy),
             Self::DevinCli => Some(ClientId::DevinCli),
             Self::DevinDesktop => Some(ClientId::DevinDesktop),
+            Self::Senpi => Some(ClientId::Senpi),
+            Self::Augment => Some(ClientId::Augment),
+            Self::Kimchi => Some(ClientId::Kimchi),
+            Self::Reasonix => Some(ClientId::Reasonix),
+            Self::PrimeAgent => Some(ClientId::PrimeAgent),
+            Self::Freebuff => Some(ClientId::Freebuff),
+            Self::Cherrystudio => Some(ClientId::CherryStudio),
+            Self::Dsh => Some(ClientId::Dsh),
+            Self::Mcode => Some(ClientId::Mcode),
+            Self::Fx => Some(ClientId::Fx),
+            Self::Omp => Some(ClientId::Omp),
             Self::Synthetic => None,
         }
     }
@@ -1132,6 +1167,17 @@ impl ClientFilter {
             ClientId::WorkBuddy => Self::Workbuddy,
             ClientId::DevinCli => Self::DevinCli,
             ClientId::DevinDesktop => Self::DevinDesktop,
+            ClientId::Senpi => Self::Senpi,
+            ClientId::Augment => Self::Augment,
+            ClientId::Kimchi => Self::Kimchi,
+            ClientId::Reasonix => Self::Reasonix,
+            ClientId::PrimeAgent => Self::PrimeAgent,
+            ClientId::Freebuff => Self::Freebuff,
+            ClientId::CherryStudio => Self::Cherrystudio,
+            ClientId::Dsh => Self::Dsh,
+            ClientId::Mcode => Self::Mcode,
+            ClientId::Fx => Self::Fx,
+            ClientId::Omp => Self::Omp,
         }
     }
 

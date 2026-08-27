@@ -490,6 +490,8 @@ pub fn get_client_color(client: &str) -> Color {
         "gjc" => Color::Rgb(220, 38, 38),          // #DC2626 gajae-code red-claw
         "jcode" => Color::Rgb(245, 158, 11),       // #F59E0B Jcode amber
         "junie" => Color::Rgb(123, 97, 255),       // #7B61FF Junie violet
+        "freebuff" => Color::Rgb(56, 189, 248),    // #38BDF8 Freebuff sky blue
+        "prime-agent" => Color::Rgb(108, 99, 255), // #6C63FF Prime violet
         _ => Color::Rgb(136, 136, 136),            // #888888
     }
 }
@@ -505,6 +507,21 @@ pub fn get_client_display_name(client: &str) -> String {
     }
     if let Some(client_id) = ClientId::from_str(&client_lower) {
         return client_ui::display_name(client_id).to_string();
+    }
+    client.to_string()
+}
+
+pub fn get_compact_client_display_name(client: &str) -> String {
+    let config = TokmeshConfig::load();
+    if let Some(name) = config.get_client_display_name(client) {
+        return name.to_string();
+    }
+    let client_lower = client.to_lowercase();
+    if client_lower == ClientId::OpenClaw.as_str() {
+        return "🦞 OpenClaw".to_string();
+    }
+    if let Some(client_id) = ClientId::from_str(&client_lower) {
+        return client_ui::compact_display_name(client_id).to_string();
     }
     client.to_string()
 }

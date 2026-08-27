@@ -162,10 +162,65 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
         display_name: "Devin Desktop",
         hotkey: 'E',
     },
+    ClientUi {
+        display_name: "Senpi (OmO Native)",
+        hotkey: 'S',
+    },
+    ClientUi {
+        display_name: "Augment Code",
+        hotkey: 'A',
+    },
+    ClientUi {
+        display_name: "Kimchi",
+        hotkey: 'K',
+    },
+    ClientUi {
+        display_name: "Reasonix",
+        hotkey: 'R',
+    },
+    ClientUi {
+        display_name: "Prime Agent",
+        hotkey: 'P',
+    },
+    ClientUi {
+        display_name: "Freebuff",
+        hotkey: 'F',
+    },
+    ClientUi {
+        display_name: "Cherry Studio",
+        hotkey: 'G',
+    },
+    ClientUi {
+        display_name: "DeepSeek Harness",
+        hotkey: 't',
+    },
+    ClientUi {
+        display_name: "MiniMax Code",
+        hotkey: 'M',
+    },
+    ClientUi {
+        display_name: "Fx",
+        hotkey: 'X',
+    },
+    ClientUi {
+        display_name: "Oh My Pi",
+        hotkey: 'Y',
+    },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {
     CLIENT_UI[client as usize].display_name
+}
+
+/// Compact label for constrained TUI columns. Product-facing surfaces should
+/// use [`display_name`] so the canonical registry label is preserved.
+pub fn compact_display_name(client: ClientId) -> &'static str {
+    match client {
+        ClientId::Senpi => "Senpi",
+        // "DeepSeek Harness" (16 cells) overflows the 15-cell Client column.
+        ClientId::Dsh => "DeepSeek",
+        _ => display_name(client),
+    }
 }
 
 pub fn hotkey(client: ClientId) -> char {

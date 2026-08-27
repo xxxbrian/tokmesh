@@ -246,7 +246,6 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
 
     let mut paths: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
-        .par_bridge()
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
@@ -365,8 +364,16 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "updates.jsonl" => file_name == "updates.jsonl",
                 "events.jsonl" => file_name == "events.jsonl",
                 "ui_messages.json" => file_name == "ui_messages.json",
+                "cline-cli-messages" => file_name.ends_with(".messages.json"),
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
+                "usage-v2.json" => file_name == "usage-v2.json",
+                "dsh-session-log" => {
+                    file_name == "session.jsonl.zstd" || file_name == "session.jsonl"
+                },
+                "prime-agent-session" => {
+                    file_name.ends_with(".jsonl") && file_name != "rlm-subagents.jsonl"
+                },
                 "workbuddy.db" => file_name == "workbuddy.db",
                 "sessions.db" => file_name == "sessions.db",
                 "state.db" => file_name == "state.db",
@@ -819,6 +826,111 @@ fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource>
     dbs
 }
 
+
+fn cline_cli_session_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let home_fallback = || PathBuf::from(home_dir).join(".cline/data/sessions");
+    if !use_env_roots {
+        return vec![home_fallback()];
+    }
+    let non_blank_env_path = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+    };
+    if let Some(path) = non_blank_env_path("CLINE_SESSION_DATA_DIR") {
+        return vec![path];
+    }
+    if let Some(path) = non_blank_env_path("CLINE_DATA_DIR") {
+        return vec![path.join("sessions")];
+    }
+    if let Some(path) = non_blank_env_path("CLINE_DIR") {
+        return vec![path.join("data/sessions")];
+    }
+    vec![home_fallback()]
+}
+
+fn kimi_work_share_dir_root(app_data: &Path) -> Option<PathBuf> {
+    let config_path = app_data.join("kimi-desktop").join("daimon-storage.json");
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let config: Value = serde_json::from_str(&content).ok()?;
+    let share_dir = config.get("shareDir")?.as_str()?;
+    if share_dir.trim().is_empty() {
+        return None;
+    }
+    Some(Path::new(share_dir).join("daimon/runtime/kimi-code/home/sessions"))
+}
+
+fn kimi_work_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    const KIMI_WORK_SUFFIX: &str =
+        "kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions";
+    if cfg!(target_os = "macos") {
+        return vec![PathBuf::from(home_dir)
+            .join("Library/Application Support")
+            .join(KIMI_WORK_SUFFIX)];
+    }
+    if cfg!(target_os = "windows") {
+        let mut roots = vec![PathBuf::from(home_dir)
+            .join("AppData/Roaming")
+            .join(KIMI_WORK_SUFFIX)];
+        if use_env_roots {
+            if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+                let app_data = PathBuf::from(app_data);
+                roots.push(
+                    kimi_work_share_dir_root(&app_data)
+                        .unwrap_or_else(|| app_data.join(KIMI_WORK_SUFFIX)),
+                );
+            }
+        }
+        return roots;
+    }
+    Vec::new()
+}
+
+fn expand_tilde_path_with_home(path: &str, home_dir: &str) -> PathBuf {
+    if path == "~" {
+        return PathBuf::from(home_dir);
+    }
+    if let Some(relative) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return PathBuf::from(home_dir).join(relative);
+    }
+    PathBuf::from(path)
+}
+
+pub fn prime_agent_session_roots_with_env_strategy(
+    home_dir: &str,
+    use_env_roots: bool,
+) -> [PathBuf; 2] {
+    fn sessions_with_sibling_artifacts(sessions: PathBuf) -> [PathBuf; 2] {
+        let artifacts = sessions
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("session-artifacts");
+        [sessions, artifacts]
+    }
+    if !use_env_roots {
+        let agent_dir = PathBuf::from(home_dir).join(".prime/agent");
+        return [
+            agent_dir.join("sessions"),
+            agent_dir.join("session-artifacts"),
+        ];
+    }
+    let session_override = std::env::var("PRIME_AGENT_SESSION_DIR")
+        .ok()
+        .or_else(|| std::env::var("PRIME_AGENT_CODING_AGENT_SESSION_DIR").ok());
+    if let Some(path) = session_override.filter(|value| !value.is_empty()) {
+        return sessions_with_sibling_artifacts(expand_tilde_path_with_home(&path, home_dir));
+    }
+    let agent_dir = std::env::var("PRIME_AGENT_CODING_AGENT_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|path| expand_tilde_path_with_home(&path, home_dir))
+        .unwrap_or_else(|| PathBuf::from(home_dir).join(".prime/agent"));
+    [
+        agent_dir.join("sessions"),
+        agent_dir.join("session-artifacts"),
+    ]
+}
+
 fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from(home_dir)
         .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks")];
@@ -1142,6 +1254,10 @@ fn scan_all_clients_with_env_strategy_inner(
                 | ClientId::Gjc
                 | ClientId::MiMoCode
                 | ClientId::DevinCli
+                | ClientId::Mcode
+                | ClientId::PrimeAgent
+                | ClientId::Freebuff
+                | ClientId::Pi
         ) {
             continue;
         }
@@ -1337,7 +1453,12 @@ fn scan_all_clients_with_env_strategy_inner(
 
         // Kimi Code: ~/.kimi-code/sessions/**/wire.jsonl (supports KIMI_CODE_HOME)
         let kimi_code_home = if use_env_roots {
-            std::env::var("KIMI_CODE_HOME").unwrap_or_else(|_| format!("{}/.kimi-code", home_dir))
+            let configured = std::env::var("KIMI_CODE_HOME").unwrap_or_default();
+            if configured.trim().is_empty() {
+                format!("{}/.kimi-code", home_dir)
+            } else {
+                configured
+            }
         } else {
             format!("{}/.kimi-code", home_dir)
         };
@@ -1348,6 +1469,10 @@ fn scan_all_clients_with_env_strategy_inner(
             ClientId::Kimi,
             kimi_code_path,
         );
+
+        for work_root in kimi_work_roots(home_dir, use_env_roots) {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Kimi, work_root);
+        }
     }
 
     if enabled.contains(&ClientId::Codex) {
@@ -1425,10 +1550,11 @@ fn scan_all_clients_with_env_strategy_inner(
         );
     }
 
-    // Oh My Pi fork (https://github.com/can1357/oh-my-pi) — same JSONL format, different root
     if enabled.contains(&ClientId::Pi) {
-        let omp_path = format!("{}/.omp/agent/sessions", home_dir);
-        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Pi, omp_path);
+        let pi_path = ClientId::Pi
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Pi, pi_path);
     }
 
     if include_synthetic {
@@ -1502,6 +1628,16 @@ fn scan_all_clients_with_env_strategy_inner(
 
         for root in cline_additional_vscode_task_roots(home_dir, use_env_roots) {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
+        }
+
+        for root in cline_cli_session_roots(home_dir, use_env_roots) {
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::Cline,
+                root,
+                "cline-cli-messages",
+            );
         }
     }
 
@@ -1744,6 +1880,119 @@ fn scan_all_clients_with_env_strategy_inner(
 
         for root in codebuff_roots {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Codebuff, root);
+        }
+    }
+
+    if enabled.contains(&ClientId::Freebuff) {
+        let trimmed_override = if use_env_roots {
+            std::env::var("FREEBUFF_DATA_DIR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    std::env::var("CODEBUFF_DATA_DIR")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                })
+        } else {
+            None
+        };
+        let mut freebuff_roots: Vec<String> = Vec::new();
+        if let Some(root) = trimmed_override {
+            freebuff_roots.push(format!("{}/projects", root.trim_end_matches('/')));
+        } else {
+            let config_dir = format!("{}/.config", home_dir);
+            for channel in ["manicode", "manicode-dev", "manicode-staging"] {
+                freebuff_roots.push(format!("{}/{}/projects", config_dir, channel));
+            }
+        }
+        for root in freebuff_roots {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Freebuff, root);
+        }
+    }
+
+    if enabled.contains(&ClientId::Mcode) {
+        for root in &headless_roots {
+            push_unique_scan_task(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::Mcode,
+                root.join("mcode"),
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::PrimeAgent) {
+        let [sessions, artifacts] =
+            prime_agent_session_roots_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::PrimeAgent,
+            sessions,
+            "prime-agent-session",
+        );
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::PrimeAgent,
+            artifacts,
+            "prime-agent-session",
+        );
+    }
+
+    if enabled.contains(&ClientId::CherryStudio) {
+        let cherry_projects = ClientId::CherryStudio
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::CherryStudio,
+            cherry_projects.clone(),
+            "*.jsonl",
+        );
+        if let Some(base) = Path::new(&cherry_projects).parent().and_then(Path::parent) {
+            let cherry_v2 = base
+                .join("Data")
+                .join("Agents")
+                .join(".claude")
+                .join("projects");
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::CherryStudio,
+                cherry_v2,
+                "*.jsonl",
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::Senpi) {
+        let senpi_path = ClientId::Senpi
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Senpi, senpi_path);
+        if use_env_roots {
+            if let Some(path) =
+                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())
+            {
+                push_unique_scan_task(
+                    &mut tasks,
+                    &mut seen_scan_roots,
+                    ClientId::Senpi,
+                    PathBuf::from(path),
+                );
+            }
+            if let Ok(current_dir) = std::env::current_dir() {
+                push_unique_scan_task(
+                    &mut tasks,
+                    &mut seen_scan_roots,
+                    ClientId::Senpi,
+                    current_dir.join(".omo").join("senpi-task").join("children"),
+                );
+            }
         }
     }
 
@@ -3482,28 +3731,33 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_all_clients_omp_scanned_as_pi() {
+    fn test_scan_all_clients_omp_scanned_as_omp() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         setup_mock_omp_dir(home);
 
         let result =
-            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
-        assert_eq!(result.get(ClientId::Pi).len(), 1);
-        assert!(result.get(ClientId::Pi)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["omp".to_string()], false);
+        assert_eq!(result.get(ClientId::Omp).len(), 1);
+        assert!(result.get(ClientId::Omp)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
+        assert!(result.get(ClientId::Pi).is_empty());
         assert!(result.get(ClientId::OpenCode).is_empty());
     }
 
     #[test]
-    fn test_scan_all_clients_pi_from_both_paths() {
+    fn test_scan_all_clients_pi_and_omp_are_separate_clients() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         setup_mock_pi_dir(home);
         setup_mock_omp_dir(home);
 
-        let result =
-            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
-        assert_eq!(result.get(ClientId::Pi).len(), 2);
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["pi".to_string(), "omp".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Pi).len(), 1);
+        assert_eq!(result.get(ClientId::Omp).len(), 1);
     }
 
     #[test]

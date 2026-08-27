@@ -25,13 +25,13 @@
 //! fallback path so compacted legacy sessions are not under-counted.
 
 use super::utils::{
-    extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
+    extract_i64, extract_string, file_modified_timestamp_ms, lossy_lines, parse_timestamp_value,
     read_file_or_none,
 };
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 const CLIENT_ID: &str = "grok";
@@ -183,7 +183,7 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut usage_turn_index = 0usize;
     let mut saw_turn_completed_usage = false;
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in lossy_lines(BufReader::new(file)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -610,7 +610,7 @@ fn read_events_metadata(path: &Path, metadata: &mut GrokMetadata) {
         return;
     };
 
-    for line in BufReader::new(file).lines().map_while(Result::ok).take(500) {
+    for line in lossy_lines(BufReader::new(file)).take(500) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };

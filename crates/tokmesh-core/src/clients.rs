@@ -1,18 +1,141 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathRoot {
     Home,
+    ReasonixHome,
     XdgData,
     Config,
+    /// Per-user application data directory via the `dirs` crate:
+    /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS,
+    /// XDG config home on Linux.
+    AppData,
     EnvVar {
         var: &'static str,
         fallback_relative: &'static str,
     },
 }
 
+fn join_home(home_dir: &str, relative: &str) -> String {
+    let mut path = std::path::PathBuf::from(home_dir);
+    for component in std::path::Path::new(relative).components() {
+        path.push(component.as_os_str());
+    }
+    path.to_string_lossy().into_owned()
+}
+
+fn app_data_follows_home(home_dir: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let home = std::path::Path::new(home_dir);
+        if !home.is_absolute() {
+            return false;
+        }
+        match dirs::home_dir() {
+            Some(profile) => home != profile.as_path(),
+            None => true,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = home_dir;
+        false
+    }
+}
+
+fn clean_reasonix_env_dir(name: &str, home_dir: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let value = expand_reasonix_env_vars(value.trim());
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let path = if value == "~" {
+        std::path::PathBuf::from(home_dir)
+    } else if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        std::path::PathBuf::from(join_home(home_dir, relative))
+    } else {
+        std::path::PathBuf::from(value)
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(path.to_string_lossy().into_owned())
+}
+
+fn expand_reasonix_env_vars(value: &str) -> String {
+    let mut expanded = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(start) = remainder.find("${") {
+        expanded.push_str(&remainder[..start]);
+        let reference = &remainder[start + 2..];
+        let Some(end) = reference.find('}') else {
+            expanded.push_str(&remainder[start..]);
+            return expanded;
+        };
+        let expression = &reference[..end];
+        let (name, default) = expression
+            .split_once(":-")
+            .map_or((expression, None), |(name, default)| (name, Some(default)));
+        let is_valid_name = name.chars().enumerate().all(|(index, character)| {
+            (character == '_' || character.is_ascii_alphabetic())
+                || (index > 0 && character.is_ascii_digit())
+        });
+        if is_valid_name {
+            match std::env::var(name) {
+                Ok(value) if !value.is_empty() => expanded.push_str(&value),
+                _ => {
+                    if let Some(default) = default {
+                        expanded.push_str(default);
+                    }
+                }
+            }
+        } else {
+            expanded.push_str(&remainder[start..start + 2 + end + 1]);
+        }
+        remainder = &reference[end + 1..];
+    }
+    expanded.push_str(remainder);
+    expanded
+}
+
 impl PathRoot {
     pub fn resolve_with_env_strategy(&self, home_dir: &str, use_env_roots: bool) -> String {
         match self {
             PathRoot::Home => home_dir.to_string(),
+            PathRoot::ReasonixHome => {
+                if use_env_roots {
+                    if let Some(state_home) =
+                        clean_reasonix_env_dir("REASONIX_STATE_HOME", home_dir)
+                    {
+                        return state_home;
+                    }
+                    if let Some(home) = clean_reasonix_env_dir("REASONIX_HOME", home_dir) {
+                        return home;
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    if use_env_roots {
+                        if let Some(config_dir) = dirs::config_dir() {
+                            return config_dir.join("reasonix").to_string_lossy().into_owned();
+                        }
+                    }
+                    std::path::Path::new(home_dir)
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("reasonix")
+                        .to_string_lossy()
+                        .into_owned()
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    join_home(home_dir, ".reasonix")
+                }
+            }
             PathRoot::XdgData => {
                 if use_env_roots {
                     std::env::var("XDG_DATA_HOME")
@@ -51,6 +174,25 @@ impl PathRoot {
                 }
 
                 format!("{home_dir}/.config/tokmesh")
+            }
+            PathRoot::AppData => {
+                if use_env_roots && !app_data_follows_home(home_dir) {
+                    if let Some(dir) = dirs::config_dir() {
+                        return dir.to_string_lossy().into_owned();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    join_home(home_dir, "AppData/Roaming")
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    join_home(home_dir, "Library/Application Support")
+                }
+                #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+                {
+                    join_home(home_dir, ".config")
+                }
             }
             PathRoot::EnvVar {
                 var,
@@ -550,6 +692,120 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    Senpi = 39 => {
+        id: "senpi",
+        root: PathRoot::EnvVar {
+            var: "SENPI_CODING_AGENT_DIR",
+            fallback_relative: ".senpi/agent",
+        },
+        relative: "sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Augment = 40 => {
+        id: "augment",
+        root: PathRoot::Home,
+        relative: ".augment/sessions",
+        pattern: "*.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Kimchi = 41 => {
+        id: "kimchi",
+        root: PathRoot::EnvVar {
+            var: "KIMCHI_CODING_AGENT_DIR",
+            fallback_relative: ".config/kimchi/harness",
+        },
+        relative: "sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Reasonix = 42 => {
+        id: "reasonix",
+        root: PathRoot::ReasonixHome,
+        relative: "stats",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    PrimeAgent = 43 => {
+        id: "prime-agent",
+        root: PathRoot::EnvVar {
+            var: "PRIME_AGENT_CODING_AGENT_DIR",
+            fallback_relative: ".prime/agent",
+        },
+        relative: "sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Freebuff = 44 => {
+        id: "freebuff",
+        root: PathRoot::EnvVar {
+            var: "FREEBUFF_DATA_DIR",
+            fallback_relative: ".config/manicode",
+        },
+        relative: "projects",
+        pattern: "chat-messages.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    CherryStudio = 45 => {
+        id: "cherrystudio",
+        root: PathRoot::AppData,
+        relative: "CherryStudio/.claude/projects",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Dsh = 46 => {
+        id: "dsh",
+        root: PathRoot::EnvVar {
+            var: "DSH_HOME",
+            fallback_relative: ".dsh",
+        },
+        relative: "sessions",
+        pattern: "dsh-session-log",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Mcode = 47 => {
+        id: "mcode",
+        root: PathRoot::Config,
+        relative: "headless/mcode",
+        pattern: "*.jsonl",
+        headless: true,
+        parse_local: true,
+        submit_default: true
+    },
+    Fx = 48 => {
+        id: "fx",
+        root: PathRoot::Home,
+        relative: ".fx/sessions",
+        pattern: "usage-v2.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Omp = 49 => {
+        id: "omp",
+        root: PathRoot::Home,
+        relative: ".omp/agent/sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -602,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 39);
+        assert_eq!(ClientId::COUNT, 50);
     }
 
     #[test]
@@ -1050,5 +1306,30 @@ mod tests {
         assert!(ClientId::Kiro.parse_local());
         assert!(ClientId::Kiro.submit_default());
         assert!(!ClientId::Kiro.supports_headless());
+    }
+
+    #[test]
+    fn test_new_daily_upstream_clients_are_registered() {
+        let cases = [
+            ("senpi", "/tmp/home/.senpi/agent/sessions", "*.jsonl"),
+            ("augment", "/tmp/home/.augment/sessions", "*.json"),
+            ("kimchi", "/tmp/home/.config/kimchi/harness/sessions", "*.jsonl"),
+            ("prime-agent", "/tmp/home/.prime/agent/sessions", "*.jsonl"),
+            ("freebuff", "/tmp/home/.config/manicode/projects", "chat-messages.json"),
+            ("dsh", "/tmp/home/.dsh/sessions", "dsh-session-log"),
+            ("fx", "/tmp/home/.fx/sessions", "usage-v2.json"),
+            ("omp", "/tmp/home/.omp/agent/sessions", "*.jsonl"),
+        ];
+        for (id, path, pattern) in cases {
+            let client = ClientId::from_str(id).unwrap_or_else(|| panic!("{id} should be registered"));
+            assert_eq!(client.data().resolve_path("/tmp/home"), path, "{id} path");
+            assert_eq!(client.data().pattern, pattern, "{id} pattern");
+            assert!(client.data().parse_local);
+            assert!(client.data().submit_default);
+        }
+        assert_eq!(ClientId::from_str("reasonix"), Some(ClientId::Reasonix));
+        assert_eq!(ClientId::from_str("cherrystudio"), Some(ClientId::CherryStudio));
+        assert_eq!(ClientId::from_str("mcode"), Some(ClientId::Mcode));
+        assert!(ClientId::Mcode.supports_headless());
     }
 }

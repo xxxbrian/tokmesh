@@ -45,6 +45,17 @@ pub mod warp;
 pub mod workbuddy;
 pub mod zcode;
 pub mod zed;
+pub mod augment;
+pub mod cherrystudio;
+pub mod dsh;
+pub mod freebuff;
+pub mod fx;
+pub mod kimchi;
+pub mod mcode;
+pub mod omp;
+pub mod prime_agent;
+pub mod reasonix;
+pub mod senpi;
 
 use crate::TokenBreakdown;
 
