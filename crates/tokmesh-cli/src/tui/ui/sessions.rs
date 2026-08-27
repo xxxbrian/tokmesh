@@ -6,8 +6,8 @@ use ratatui::widgets::{
 
 use super::widgets::{
     display_width, format_cache_hit_rate, format_cost, format_cost_per_million, format_tokens,
-    get_compact_client_display_name, prefix_to_width, total_tokens_cell, truncate_text, truncate_to_width,
-    viewport_scrollbar_state,
+    get_compact_client_display_name, prefix_to_width, total_tokens_cell, truncate_text,
+    truncate_to_width, viewport_scrollbar_state,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use crate::tui::data::{SessionModel, SessionUsage};

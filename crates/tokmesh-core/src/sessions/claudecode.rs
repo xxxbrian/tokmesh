@@ -2397,7 +2397,7 @@ mod tests {
     }
 
     #[test]
-        fn test_multi_provider_models_prefer_specific_model_over_default_anthropic_hint() {
+    fn test_multi_provider_models_prefer_specific_model_over_default_anthropic_hint() {
         let content = r#"{"type":"assistant","provider":"anthropic","timestamp":"2026-02-18T10:00:00.000Z","message":{"model":"gpt-5.3-codex","usage":{"input_tokens":200,"output_tokens":20}}}"#;
 
         let file = create_test_file(content);

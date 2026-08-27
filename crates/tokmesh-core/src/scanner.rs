@@ -370,10 +370,10 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "usage-v2.json" => file_name == "usage-v2.json",
                 "dsh-session-log" => {
                     file_name == "session.jsonl.zstd" || file_name == "session.jsonl"
-                },
+                }
                 "prime-agent-session" => {
                     file_name.ends_with(".jsonl") && file_name != "rlm-subagents.jsonl"
-                },
+                }
                 "workbuddy.db" => file_name == "workbuddy.db",
                 "sessions.db" => file_name == "sessions.db",
                 "state.db" => file_name == "state.db",
@@ -825,7 +825,6 @@ fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource>
     dbs.dedup_by(|a, b| a.db_path == b.db_path);
     dbs
 }
-
 
 fn cline_cli_session_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
     let home_fallback = || PathBuf::from(home_dir).join(".cline/data/sessions");
@@ -1973,7 +1972,12 @@ fn scan_all_clients_with_env_strategy_inner(
         let senpi_path = ClientId::Senpi
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
-        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Senpi, senpi_path);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Senpi,
+            senpi_path,
+        );
         if use_env_roots {
             if let Some(path) =
                 std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())

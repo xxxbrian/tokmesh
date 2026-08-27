@@ -1313,22 +1313,34 @@ mod tests {
         let cases = [
             ("senpi", "/tmp/home/.senpi/agent/sessions", "*.jsonl"),
             ("augment", "/tmp/home/.augment/sessions", "*.json"),
-            ("kimchi", "/tmp/home/.config/kimchi/harness/sessions", "*.jsonl"),
+            (
+                "kimchi",
+                "/tmp/home/.config/kimchi/harness/sessions",
+                "*.jsonl",
+            ),
             ("prime-agent", "/tmp/home/.prime/agent/sessions", "*.jsonl"),
-            ("freebuff", "/tmp/home/.config/manicode/projects", "chat-messages.json"),
+            (
+                "freebuff",
+                "/tmp/home/.config/manicode/projects",
+                "chat-messages.json",
+            ),
             ("dsh", "/tmp/home/.dsh/sessions", "dsh-session-log"),
             ("fx", "/tmp/home/.fx/sessions", "usage-v2.json"),
             ("omp", "/tmp/home/.omp/agent/sessions", "*.jsonl"),
         ];
         for (id, path, pattern) in cases {
-            let client = ClientId::from_str(id).unwrap_or_else(|| panic!("{id} should be registered"));
+            let client =
+                ClientId::from_str(id).unwrap_or_else(|| panic!("{id} should be registered"));
             assert_eq!(client.data().resolve_path("/tmp/home"), path, "{id} path");
             assert_eq!(client.data().pattern, pattern, "{id} pattern");
             assert!(client.data().parse_local);
             assert!(client.data().submit_default);
         }
         assert_eq!(ClientId::from_str("reasonix"), Some(ClientId::Reasonix));
-        assert_eq!(ClientId::from_str("cherrystudio"), Some(ClientId::CherryStudio));
+        assert_eq!(
+            ClientId::from_str("cherrystudio"),
+            Some(ClientId::CherryStudio)
+        );
         assert_eq!(ClientId::from_str("mcode"), Some(ClientId::Mcode));
         assert!(ClientId::Mcode.supports_headless());
     }
