@@ -24,6 +24,17 @@ static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
 /// and should be excluded from pay-per-token cost estimation.
 const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
 
+/// Walk `source()` so a transport failure is not just "error sending request".
+pub fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
 pub struct PricingService {
     custom: CustomPricing,
     lookup: PricingLookup,

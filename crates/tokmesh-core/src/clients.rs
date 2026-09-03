@@ -806,6 +806,35 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // LM Studio's OpenAI-compatible local server writes final response usage
+    // blocks to nested monthly logs. Local inference has an authoritative
+    // zero monetary cost.
+    LmStudio = 50 => {
+        id: "lmstudio",
+        root: PathRoot::EnvVar {
+            var: "LM_STUDIO_HOME",
+            fallback_relative: ".lmstudio",
+        },
+        relative: "server-logs",
+        pattern: "*.log",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Unsloth Studio persists exact inference usage in a single SQLite
+    // database.
+    Unsloth = 51 => {
+        id: "unsloth",
+        root: PathRoot::EnvVar {
+            var: "UNSLOTH_STUDIO_HOME",
+            fallback_relative: ".unsloth/studio",
+        },
+        relative: "studio.db",
+        pattern: "studio.db",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1327,6 +1356,8 @@ mod tests {
             ("dsh", "/tmp/home/.dsh/sessions", "dsh-session-log"),
             ("fx", "/tmp/home/.fx/sessions", "usage-v2.json"),
             ("omp", "/tmp/home/.omp/agent/sessions", "*.jsonl"),
+            ("lmstudio", "/tmp/home/.lmstudio/server-logs", "*.log"),
+            ("unsloth", "/tmp/home/.unsloth/studio/studio.db", "studio.db"),
         ];
         for (id, path, pattern) in cases {
             let client =

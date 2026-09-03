@@ -206,6 +206,14 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
         display_name: "Oh My Pi",
         hotkey: 'Y',
     },
+    ClientUi {
+        display_name: "LM Studio",
+        hotkey: 'L',
+    },
+    ClientUi {
+        display_name: "Unsloth",
+        hotkey: 'U',
+    },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {
