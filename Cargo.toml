@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Tokmesh contributors"]
 license = "MIT"
@@ -16,8 +16,8 @@ homepage = "https://github.com/xxxbrian/tokmesh"
 
 [workspace.dependencies]
 # Internal crates (path for local dev; version required for crates.io publish)
-tokmesh-core = { path = "crates/tokmesh-core", version = "0.1.2" }
-tokmesh-cli = { path = "crates/tokmesh-cli", version = "0.1.2" }
+tokmesh-core = { path = "crates/tokmesh-core", version = "0.1.3" }
+tokmesh-cli = { path = "crates/tokmesh-cli", version = "0.1.3" }
 
 # Parallelism
 rayon = "1.10"
