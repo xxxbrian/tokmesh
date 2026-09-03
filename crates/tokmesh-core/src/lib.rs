@@ -920,6 +920,107 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         )
     }
 
+    fn load_or_parse_opencode_sqlite_source(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+    ) -> CachedParseOutcome {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::OpenCode);
+
+        fn finish(
+            identity: message_cache::CacheIdentity,
+            path: &Path,
+            fingerprint: Option<message_cache::SourceFingerprint>,
+            scan: sessions::opencode_schema::OpenCodeSchemaScan,
+            pricing: Option<&pricing::PricingService>,
+        ) -> CachedParseOutcome {
+            let mut messages = scan.messages;
+            let cache_entry = match fingerprint {
+                Some(fingerprint) if !messages.is_empty() => Some(
+                    message_cache::CachedSourceEntry::new(
+                        identity,
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    )
+                    .with_opencode_incremental(scan.incremental),
+                ),
+                _ => None,
+            };
+            apply_pricing_to_messages(&mut messages, pricing);
+            CachedParseOutcome {
+                messages,
+                cache_entry,
+                invalidate_cache: false,
+            }
+        }
+
+        let mut cached = source_cache.get(identity, path).cloned();
+        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_sqlite_path(
+            path,
+            cached.as_ref().map(|entry| &entry.fingerprint),
+        ) else {
+            return finish(
+                identity,
+                path,
+                None,
+                sessions::opencode::scan_opencode_sqlite(path),
+                pricing,
+            );
+        };
+
+        let fingerprint = match fingerprint_status {
+            message_cache::FingerprintStatus::Unchanged => {
+                let Some(entry) = cached.take() else {
+                    unreachable!("an uncached source always builds a complete fingerprint")
+                };
+                if !entry.messages.is_empty() {
+                    return CachedParseOutcome {
+                        messages: cached_messages(&entry, pricing),
+                        cache_entry: None,
+                        invalidate_cache: false,
+                    };
+                }
+                let fingerprint = entry.fingerprint.clone();
+                cached = Some(entry);
+                fingerprint
+            }
+            message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+        };
+
+        if let Some(entry) = cached {
+            if entry.fingerprint == fingerprint && !entry.messages.is_empty() {
+                return CachedParseOutcome {
+                    messages: cached_messages(&entry, pricing),
+                    cache_entry: None,
+                    invalidate_cache: false,
+                };
+            }
+
+            if let (Some(state), false) = (
+                entry.opencode_incremental.as_ref(),
+                entry.messages.is_empty(),
+            ) {
+                let state = state.clone();
+                if let Some(scan) =
+                    sessions::opencode::rescan_opencode_sqlite(path, &state, entry.messages)
+                {
+                    return finish(identity, path, Some(fingerprint), scan, pricing);
+                }
+            }
+        }
+
+        finish(
+            identity,
+            path,
+            Some(fingerprint),
+            sessions::opencode::scan_opencode_sqlite(path),
+            pricing,
+        )
+    }
+
     fn load_or_parse_sqlite_source<F>(
         identity: message_cache::CacheIdentity,
         path: &Path,
@@ -1066,30 +1167,31 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     // Parse OpenCode: prefer SQLite, collapse forked SQLite history there, then
     // suppress legacy JSON overlap by message identity.
     let mut opencode_seen: HashSet<String> = HashSet::new();
+    let mut opencode_sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
 
     for db_path in &scan_result.opencode_dbs {
         let CachedParseOutcome {
             messages,
             cache_entry,
             ..
-        } = load_or_parse_sqlite_source(
-            message_cache::CacheIdentity::for_client(ClientId::OpenCode),
-            db_path,
-            &source_cache,
-            pricing,
-            sessions::opencode::parse_opencode_sqlite,
-        );
+        } = load_or_parse_opencode_sqlite_source(db_path, &source_cache, pricing);
 
         // Dedup across channel-suffixed dbs: the same session can end up in
         // both `opencode.db` and `opencode-<channel>.db` if the user
         // switches channels mid-session. `discover_opencode_dbs` returns
         // paths in sorted order, so the first-seen copy is deterministic.
-        all_messages.extend(messages.into_iter().filter(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| opencode_seen.insert(key.clone()))
-        }));
+        for message in messages {
+            if let Some(key) = message.dedup_key.as_ref() {
+                opencode_sqlite_locations
+                    .entry(message.session_id.clone())
+                    .or_default()
+                    .insert(key.clone());
+                if !opencode_seen.insert(key.clone()) {
+                    continue;
+                }
+            }
+            all_messages.push(message);
+        }
 
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -1099,6 +1201,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     let opencode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
+        .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_sqlite_locations))
         .filter_map(|path| {
             Some(load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::OpenCode),
@@ -1547,12 +1650,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    // Command Code does not persist token usage or cost locally, so tokens are
-    // estimated and priced. The model id comes from ~/.commandcode/config.json
-    // (canonicalized, e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3"), not the
-    // transcript, so the source cache — which fingerprints only the transcript
-    // file — is bypassed: otherwise a config.json model change would leave stale
-    // cached pricing until the transcript itself changed.
+    // Command Code's v3 transcripts persist per-request usage and cost on
+    // assistant lines. Reprice only messages that carry no embedded cost.
+    let mut commandcode_seen: HashSet<String> = HashSet::new();
     let commandcode_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
@@ -1560,13 +1660,19 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             sessions::commandcode::parse_commandcode_file(path)
                 .into_iter()
                 .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
+                    if msg.cost <= 0.0 {
+                        apply_pricing_if_available(&mut msg, pricing);
+                    }
                     msg
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
-    all_messages.extend(commandcode_messages);
+    all_messages.extend(
+        commandcode_messages
+            .into_iter()
+            .filter(|message| should_keep_deduped_message(&mut commandcode_seen, message)),
+    );
 
     // gjc (gajae-code) JSONL sessions. Binding note N1: this cached cluster
     // MUST obtain messages via the non-repricing parser and apply the A1
@@ -1927,6 +2033,58 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .collect();
     for outcome in dsh_outcomes {
         all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let lmstudio_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::LmStudio)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::LmStudio),
+                path,
+                &source_cache,
+                pricing,
+                sessions::lmstudio::parse_lmstudio_file,
+            )
+        })
+        .collect();
+    let mut lmstudio_seen = HashSet::new();
+    for outcome in lmstudio_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut lmstudio_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let unsloth_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Unsloth)
+        .par_iter()
+        .map(|db_path| {
+            load_or_parse_sqlite_source(
+                message_cache::CacheIdentity::for_client(ClientId::Unsloth),
+                db_path,
+                &source_cache,
+                pricing,
+                sessions::unsloth::parse_unsloth_sqlite,
+            )
+        })
+        .collect();
+    let mut unsloth_seen = HashSet::new();
+    for outcome in unsloth_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut unsloth_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -3120,6 +3278,27 @@ fn parse_local_unified_messages_resolved(
     );
     Ok(filter_unified_messages(messages, &options))
 }
+
+fn opencode_json_superseded_by_sqlite(
+    path: &Path,
+    sqlite_locations: &HashMap<String, HashSet<String>>,
+) -> bool {
+    let Some(message_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(session_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+
+    sqlite_locations
+        .get(session_id)
+        .is_some_and(|message_ids| message_ids.contains(message_id))
+}
+
 pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages, String> {
     let start = Instant::now();
 
@@ -3390,17 +3569,18 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
 
-    let commandcode_msgs: Vec<ParsedMessage> = scan_result
+    let commandcode_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
-        .flat_map(|path| {
-            sessions::commandcode::parse_commandcode_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::commandcode::parse_commandcode_file(path))
         .collect();
-    let commandcode_count = commandcode_msgs.len() as i32;
+    let mut commandcode_seen: HashSet<String> = HashSet::new();
+    let commandcode_msgs: Vec<ParsedMessage> = commandcode_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut commandcode_seen, message))
+        .map(|msg| unified_to_parsed(&msg))
+        .collect();
+    let commandcode_count = summed_parsed_message_count(&commandcode_msgs);
     counts.set(ClientId::CommandCode, commandcode_count);
     messages.extend(commandcode_msgs);
 
@@ -3721,6 +3901,36 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let omp_count = summed_parsed_message_count(&omp_msgs);
     counts.set(ClientId::Omp, omp_count);
     messages.extend(omp_msgs);
+
+    let lmstudio_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::LmStudio)
+        .par_iter()
+        .flat_map(|path| sessions::lmstudio::parse_lmstudio_file(path))
+        .collect();
+    let mut lmstudio_seen: HashSet<String> = HashSet::new();
+    let lmstudio_msgs: Vec<ParsedMessage> = lmstudio_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut lmstudio_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let lmstudio_count = summed_parsed_message_count(&lmstudio_msgs);
+    counts.set(ClientId::LmStudio, lmstudio_count);
+    messages.extend(lmstudio_msgs);
+
+    let unsloth_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Unsloth)
+        .par_iter()
+        .flat_map(|path| sessions::unsloth::parse_unsloth_sqlite(path))
+        .collect();
+    let mut unsloth_seen: HashSet<String> = HashSet::new();
+    let unsloth_msgs: Vec<ParsedMessage> = unsloth_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut unsloth_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let unsloth_count = summed_parsed_message_count(&unsloth_msgs);
+    counts.set(ClientId::Unsloth, unsloth_count);
+    messages.extend(unsloth_msgs);
 
     let mux_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mux)

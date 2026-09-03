@@ -1755,7 +1755,7 @@ fn antigravity_https_client() -> &'static reqwest::Client {
     })
 }
 
-async fn read_reqwest_response_with_cap(
+pub(crate) async fn read_reqwest_response_with_cap(
     mut response: reqwest::Response,
     max_body_bytes: usize,
 ) -> Result<String> {

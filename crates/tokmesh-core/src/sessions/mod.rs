@@ -35,12 +35,14 @@ pub mod kilocode;
 pub mod kimchi;
 pub mod kimi;
 pub mod kiro;
+pub mod lmstudio;
 pub mod mcode;
 pub mod micode;
 pub mod mux;
 pub mod omp;
 pub mod openclaw;
 pub mod opencode;
+pub(crate) mod opencode_schema;
 pub mod opencodereview;
 pub mod pi;
 pub mod prime_agent;
@@ -51,6 +53,7 @@ pub mod senpi;
 pub mod synthetic;
 pub(crate) mod tencent_buddy;
 pub mod trae;
+pub mod unsloth;
 pub(crate) mod utils;
 pub mod warp;
 pub mod workbuddy;
@@ -458,7 +461,6 @@ fn timestamp_to_date(timestamp_ms: i64) -> String {
     crate::bucket_tz::bucket_timezone().date_of_ms(timestamp_ms)
 }
 
-#[cfg(test)]
 fn timestamp_to_date_with_timezone<Tz>(timestamp_ms: i64, timezone: &Tz) -> String
 where
     Tz: chrono::TimeZone,

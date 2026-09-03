@@ -7,7 +7,7 @@
 //! same rows to a plain `session.jsonl` in the same directory, so this parser
 //! dispatches on the zstd frame magic rather than on the file name.
 //!
-//! The transcript is an append-only event stream; the rows Tokmesh needs are:
+//! The transcript is an append-only event stream; the rows Tokscale needs are:
 //!
 //! - `session`: session id, `createdAt` (ms), `cwd` (workspace root), and the
 //!   `seedLength` fork boundary.
@@ -15,7 +15,10 @@
 //!   for messages whose `source` is absent).
 //! - `assistant/message`: authoritative per-call usage on `data.usage`
 //!   (`inputTokens`, `outputTokens`, `cacheReadTokens`, ...) plus the serving
-//!   provider/model on `data.message.source`.
+//!   provider and model on `data.message.source`. `source.model` is the model
+//!   configured for the request; when the provider serves a different model,
+//!   the response records its concrete identity on
+//!   `source.replayState.response.responseModel`, which takes precedence.
 //! - `compaction/summary`: the same usage and routing shape for the summarize
 //!   call DSH makes when it compacts a range. Real spend on the same account,
 //!   and disjoint from the loop steps around it.
@@ -248,7 +251,7 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                     .map(str::to_string);
                 fallback_model = config
                     .and_then(|c| c.get("model"))
-                    .and_then(Value::as_str)
+                    .and_then(non_empty_string)
                     .map(str::to_string);
             }
             "user/message" => {
@@ -293,9 +296,7 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 }
 
                 let source = value.pointer("/data/message/source");
-                let model_id = source
-                    .and_then(|s| s.get("model"))
-                    .and_then(Value::as_str)
+                let model_id = served_model(source)
                     .or(fallback_model.as_deref())
                     .unwrap_or("unknown")
                     .to_string();
@@ -342,18 +343,33 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 // keys differ, and the cross-file pass -- which only collapses
                 // identical keys -- bills the summarize call twice.
                 //
-                // `seq` is the other field a fork copies verbatim (see the
-                // boundary check above), so it stands in for the missing id and
-                // stays identical across the copy. It is unique within a file,
-                // and pairing it with the timestamp, routing and buckets already
-                // in the key means an accidental merge would need two unrelated
-                // sessions to agree on all of them at millisecond resolution.
+                // Summaries carry their own per-call UUID on
+                // `data.compactionId`, and a fork copies it verbatim. Prefer it
+                // before `seq`: sequence numbers restart in every transcript,
+                // so unrelated summaries can otherwise collapse when their
+                // timestamp, routing and usage happen to agree (#1187).
+                //
+                // Keep `seq` as the final cross-file fallback for older or
+                // damaged summaries without a compaction id. It remains better
+                // than the session id for the seedLength-less fork handled by
+                // #1173, because the fork copies the sequence number too.
                 let identity = value
                     .pointer("/data/message/id")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|id| !id.is_empty())
                     .map(|id| format!("msg:{id}"))
+                    .or_else(|| {
+                        if !is_summary {
+                            return None;
+                        }
+                        value
+                            .pointer("/data/compactionId")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(|id| format!("cmp:{id}"))
+                    })
                     .or_else(|| {
                         value
                             .get("seq")
@@ -403,6 +419,32 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
     }
 
     messages
+}
+
+/// Return the concrete model that served a DSH call.
+///
+/// `source.model` is the configured request model. Floating aliases and
+/// provider-side substitutions can resolve to another model, which pi-ai
+/// records as `replayState.response.responseModel` when it differs from the
+/// request. That response identity is authoritative for attribution, pricing,
+/// and the model slot in the dedup key. Rows without it keep the configured
+/// source model, then the caller falls back to the latest request header.
+fn served_model(source: Option<&Value>) -> Option<&str> {
+    source
+        .and_then(|value| value.pointer("/replayState/response/responseModel"))
+        .and_then(non_empty_string)
+        .or_else(|| {
+            source
+                .and_then(|value| value.get("model"))
+                .and_then(non_empty_string)
+        })
+}
+
+fn non_empty_string(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Split DSH's usage row into Tokmesh's five additive buckets.
@@ -629,9 +671,6 @@ mod tests {
         assert_eq!(first.workspace_label.as_deref(), Some("proj"));
         // This row carries no `message.id`, so the key falls back to `seq`
         // rather than the session id: a fork copies `seq` verbatim, so the key
-        // survives the copy and the cross-file pass can collapse the two.
-        // This row carries no `message.id`, so the key falls back to `seq`
-        // rather than the session id: a fork copies `seq` verbatim, so the key
         // survives the copy and the cross-file pass can still collapse the two.
         assert_eq!(
             first.dedup_key.as_deref(),
@@ -640,6 +679,72 @@ mod tests {
 
         // Same turn, later step: not a turn start.
         assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn attributes_usage_to_the_model_reported_by_the_provider() {
+        // Real DSH/pi-ai response shape: the session requested glm-5.2, while
+        // the provider returned glm-5.3 and pi-ai preserved that substitution
+        // in replayState.response.responseModel.
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"session-served","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"assistant/message","seq":42,"time":1787122684043,"data":{"turn":1,"message":{"id":"m-served","source":{"kind":"model","provider":"zai-coding-cn","model":"glm-5.2","replayState":{"response":{"kind":"pi-ai","version":2,"api":"openai-completions","provider":"zai-coding-cn","model":"glm-5.2","responseModel":"glm-5.3","stopReason":"toolUse"}}}},"usage":{"inputTokens":8425,"outputTokens":207,"cacheReadTokens":576}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "glm-5.3");
+        assert_eq!(messages[0].provider_id, "zai-coding-cn");
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("dsh:msg:m-served:1787122684043:zai-coding-cn:glm-5.3:8425:207:576:0:0")
+        );
+    }
+
+    #[test]
+    fn resolves_a_floating_request_alias_to_its_concrete_served_model() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"session-alias","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"assistant/message","time":1787122684043,"data":{"turn":1,"message":{"id":"m-alias","source":{"kind":"model","provider":"openrouter","model":"~x-ai/grok-latest","replayState":{"response":{"kind":"pi-ai","version":2,"api":"openai-completions","provider":"openrouter","model":"~x-ai/grok-latest","responseModel":"x-ai/grok-4.6","stopReason":"stop"}}}},"usage":{"inputTokens":100,"outputTokens":20}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "x-ai/grok-4.6");
+        assert_eq!(messages[0].provider_id, "openrouter");
+    }
+
+    #[test]
+    fn served_model_uses_only_non_empty_string_response_values() {
+        for (source, expected) in [
+            (
+                serde_json::json!({
+                    "model": " configured ",
+                    "replayState": { "response": { "responseModel": " served " } }
+                }),
+                Some("served"),
+            ),
+            (
+                serde_json::json!({
+                    "model": " configured ",
+                    "replayState": { "response": { "responseModel": "   " } }
+                }),
+                Some("configured"),
+            ),
+            (
+                serde_json::json!({
+                    "model": " configured ",
+                    "replayState": { "response": { "responseModel": 123 } }
+                }),
+                Some("configured"),
+            ),
+            (serde_json::json!({ "model": "   " }), None),
+        ] {
+            assert_eq!(served_model(Some(&source)), expected);
+        }
+        assert_eq!(served_model(None), None);
     }
 
     #[test]
@@ -672,6 +777,23 @@ mod tests {
         // A summary is not a loop step, so it never claims the turn.
         assert!(messages[0].is_turn_start);
         assert!(!summary.is_turn_start);
+    }
+
+    #[test]
+    fn compaction_summary_uses_the_concrete_served_model() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"session-summary-model","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":8,"time":1786669450002,"data":{"message":{"source":{"provider":"openrouter","model":"~x-ai/grok-latest","replayState":{"response":{"responseModel":"x-ai/grok-4.6"}}}},"usage":{"inputTokens":10,"outputTokens":20}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "x-ai/grok-4.6");
+        assert!(messages[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.contains(":openrouter:x-ai/grok-4.6:")));
     }
 
     #[test]
@@ -751,7 +873,7 @@ mod tests {
         // given: DSH's `outputTokens` is the provider's `completion_tokens`
         // and `reasoningTokens` is `completion_tokens_details.reasoning_tokens`
         // — a subset of it, which is why DSH's own token meter sums
-        // input + cache + output and never adds reasoning. Tokmesh's buckets
+        // input + cache + output and never adds reasoning. Tokscale's buckets
         // are additive and pricing bills output and reasoning at the same
         // output rate, so mapping both fields through bills reasoning twice.
         // Numbers taken from a committed DSH transcript
@@ -892,7 +1014,7 @@ mod tests {
         // `dsh:summary:sid:parent...` and `dsh:summary:sid:child...`; the
         // cross-file pass only collapses identical keys, so the summarize call
         // was billed twice.
-        let row = r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#;
+        let row = r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"1ad33c8f-5255-4158-b607-7555f3c26cd0","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#;
         let parent = write_zstd_session(&[
             r#"{"type":"session","id":"96cf59c9-b347-48b9-b234-a5200913ad05","createdAt":1,"cwd":"/work"}"#,
             row,
@@ -914,11 +1036,59 @@ mod tests {
         );
         assert_eq!(
             parent_messages[0].dedup_key.as_deref(),
-            Some("dsh:summary:seq:4:1786669450002:p:m:10:20:0:0:0")
+            Some(
+                "dsh:summary:cmp:1ad33c8f-5255-4158-b607-7555f3c26cd0:1786669450002:p:m:10:20:0:0:0"
+            )
         );
         assert_eq!(
             parent_messages[0].dedup_key, child_messages[0].dedup_key,
             "a copied summary must collapse across the fork, or its cost is counted twice"
+        );
+    }
+
+    #[test]
+    fn distinct_compaction_ids_keep_otherwise_identical_summaries() {
+        let first = write_zstd_session(&[
+            r#"{"type":"session","id":"session-a","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-a","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20,"cacheReadTokens":30}}}"#,
+        ]);
+        let second = write_zstd_session(&[
+            r#"{"type":"session","id":"session-b","createdAt":2,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-b","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20,"cacheReadTokens":30}}}"#,
+        ]);
+
+        let first_messages = parse_dsh_file(first.path());
+        let second_messages = parse_dsh_file(second.path());
+
+        assert_eq!(first_messages.len(), 1);
+        assert_eq!(second_messages.len(), 1);
+        assert_eq!(
+            first_messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-a:1786669450002:p:m:10:20:30:0:0")
+        );
+        assert_eq!(
+            second_messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-b:1786669450002:p:m:10:20:30:0:0")
+        );
+        assert_ne!(
+            first_messages[0].dedup_key, second_messages[0].dedup_key,
+            "globally distinct summarize calls must both survive lane dedup"
+        );
+    }
+
+    #[test]
+    fn summary_without_compaction_id_keeps_seq_fallback() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"legacy-summary","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":9,"time":1786669450002,"data":{"message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:seq:9:1786669450002:p:m:10:20:0:0:0")
         );
     }
 

@@ -239,13 +239,245 @@ pub fn copilot_exporter_path() -> Option<PathBuf> {
 }
 
 /// Scan a single directory for session files
+
+/// Candidate roots for Devin CLI's Windows `sessions.db`.
+fn devin_cli_additional_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if cfg!(target_os = "windows") && use_env_roots {
+        if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(app_data).join("devin/cli"));
+        }
+    }
+
+    roots.push(PathBuf::from(home_dir).join("AppData/Roaming/devin/cli"));
+    roots
+}
+
+/// How much of a Senpi session file the project-root probe may read. The
+/// `{"type":"session",...}` header is the first line and stays well under 1KB
+/// in practice; the cap only bounds pathological files.
+const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
+
+/// What one `.omo` config layer says about OmO's task state directory.
+///
+/// The three cases are deliberately distinct. OmO's merge replaces the whole
+/// `task` block rather than deep-merging it, so a layer that declares `task`
+/// silences the layer above it even when it names no usable `state_dir` — that
+/// is [`OmoTaskState::DefaultLayout`], and it must not fall through.
+#[derive(Debug, PartialEq)]
+enum OmoTaskState {
+    /// No config here, or one that declares no `task` block: the layer above
+    /// still decides.
+    Unset,
+    /// A `task` block naming a state directory this host can use as-is.
+    StateDir(PathBuf),
+    /// A `task` block that overrides the layer above but names no usable
+    /// `state_dir`, so OmO's default `<project>/.omo/senpi-task` applies.
+    DefaultLayout,
+}
+
+/// Read OmO's `task` state-directory setting out of one `.omo` directory.
+///
+/// OmO loads `omo.jsonc` and falls back to `omo.json`
+/// (`omo-config-core/src/loader/paths.ts`), both JSONC, so comments and
+/// trailing commas have to survive the parse. A file that exists but cannot be
+/// parsed is treated as absent rather than as an override, since a syntax error
+/// should not silently redirect the scan.
+///
+/// A relative `state_dir` yields [`OmoTaskState::DefaultLayout`]: OmO resolves
+/// it against its own process cwd, which a later tokmesh run cannot
+/// reconstruct, so the default project layout is safer than guessing a base —
+/// but the declaring layer still wins over the one above it.
+fn omo_task_state(omo_dir: &Path) -> OmoTaskState {
+    for filename in ["omo.jsonc", "omo.json"] {
+        let Ok(contents) = std::fs::read_to_string(omo_dir.join(filename)) else {
+            continue;
+        };
+        let Some(config) = crate::opencode_model_name::parse_jsonc(&contents) else {
+            continue;
+        };
+        let Some(task) = config.get("task") else {
+            return OmoTaskState::Unset;
+        };
+        let state_dir = task
+            .get("state_dir")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        return match state_dir {
+            Some(path) => OmoTaskState::StateDir(path),
+            None => OmoTaskState::DefaultLayout,
+        };
+    }
+    OmoTaskState::Unset
+}
+
+/// The OmO task-children root to scan for one project.
+///
+/// Mirrors `resolveStateDir()` in OmO's `senpi-task` package,
+/// `config.task?.state_dir ?? join(config.project_dir, ".omo", "senpi-task")`,
+/// with the children hanging off it as `<state_dir>/children/<task>/sessions/`
+/// (`tools/output/transcript/session-dir.ts`). The project's own `.omo` config
+/// wins over the user's `~/.omo` one, matching OmO's nearest-config-first merge;
+/// tokmesh deliberately does not walk the intermediate directories OmO would,
+/// because a report spans many workspaces and there is no single current project.
+fn senpi_omo_children_root(project_dir: &Path, user_state_dir: Option<&Path>) -> PathBuf {
+    let default_layout = || project_dir.join(".omo").join("senpi-task");
+    let state_dir = match omo_task_state(&project_dir.join(".omo")) {
+        OmoTaskState::StateDir(path) => path,
+        // The project declared `task`, so the user layer is already replaced.
+        OmoTaskState::DefaultLayout => default_layout(),
+        OmoTaskState::Unset => user_state_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(default_layout),
+    };
+    state_dir.join("children")
+}
+
+/// Discover OmO task-children scan roots from a Senpi sessions tree.
+///
+/// OmO redirects task child transcripts into project-local
+/// `.omo/senpi-task/children/` (#1112), which is only reachable if you know the
+/// project root. Senpi's sessions dir has one subdirectory per project
+/// (`sessions/<encoded-cwd>/`), but the encoding is lossy — a `-` may be a
+/// separator or a literal character — so instead of decoding the name, read the
+/// `cwd`s recorded in that subdirectory's session headers. Because the encoding
+/// is lossy in both directions, one subdirectory can serve several projects, so
+/// every distinct header `cwd` is taken, not just the newest one. Every
+/// discovered `<cwd>/.omo/senpi-task/children` that exists on disk becomes a
+/// scan root; overlaps with the cwd-derived root are collapsed by the scanner's
+/// existing path dedup.
+fn discover_senpi_omo_children_roots(
+    sessions_root: &Path,
+    user_state_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        // A symlinked per-project directory is still a project directory; the
+        // scanner follows those when it walks the sessions tree.
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+        })
+        .flat_map(|entry| senpi_project_cwds_from_session_dir(&entry.path()))
+        // A relative `cwd` (corrupt or hand-edited header) would resolve
+        // against the tokmesh process cwd and could register an unrelated
+        // directory as a scan root.
+        .filter(|cwd| cwd.is_absolute())
+        .filter_map(|cwd| {
+            let children = senpi_omo_children_root(&cwd, user_state_dir);
+            children.is_dir().then_some(children)
+        })
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+/// Read every distinct project `cwd` recorded in one per-project Senpi session
+/// directory.
+///
+/// `sessions/<encoded-cwd>` names are lossy — a `-` is either a path separator
+/// or a literal character — so two projects can share one directory
+/// (`/a/b-c` and `/a/b/c` both encode to `--a-b-c--`), and their transcripts
+/// then interleave inside it. Returning only the first header's `cwd` would
+/// hide every colliding project but the newest, which is the exact
+/// cross-project omission this discovery exists to fix, so all headers are read
+/// and the distinct `cwd`s collected.
+///
+/// Every transcript is read, with no window or cap: any sampling scheme can
+/// bury a project whose only header falls outside it, and this discovery exists
+/// precisely so that no project is missed. The cost is one `open` plus one
+/// `read_line` per transcript — 0.3ms over the real sessions tree measured here
+/// (9 projects, 26 transcripts) and ~24us per transcript as the tree grows.
+///
+/// Only the first line of each candidate is examined: real transcripts always
+/// start with the `{"type":"session",...}` header, so a non-header first line
+/// means a truncated or foreign file, not a deeper-buried header. Results are
+/// sorted so the scan order of the directory does not leak into the output.
+fn senpi_project_cwds_from_session_dir(session_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
+    let mut cwds: Vec<PathBuf> = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        // Same follow-file rule as `scan_directory`: trust the cheap dirent
+        // type for regular files and pay a following stat only for symlinks,
+        // which the normal scanner counts as transcripts too.
+        if !entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl"))
+        {
+            continue;
+        }
+        if let Some(cwd) = senpi_session_header_cwd(&path) {
+            // A directory holds a handful of distinct projects at most, so a
+            // linear membership check beats hashing every path, and streaming
+            // the entries avoids materialising one `PathBuf` per transcript.
+            if !cwds.contains(&cwd) {
+                cwds.push(cwd);
+            }
+        }
+    }
+    cwds.sort_unstable();
+    cwds
+}
+
+/// Parse the `cwd` field from a Senpi session file's header line, if the first
+/// line is a session header.
+fn senpi_session_header_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut first_line = String::new();
+    BufReader::new(file.take(SENPI_SESSION_HEADER_MAX_BYTES))
+        .read_line(&mut first_line)
+        .ok()?;
+
+    let header: Value = serde_json::from_str(first_line.trim()).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("cwd").and_then(Value::as_str).map(PathBuf::from)
+}
+
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
     if !std::path::Path::new(root).exists() {
         return Vec::new();
     }
 
+    let prune_extension_siblings = pattern == "codebuddy-extension-log";
+
     let mut paths: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|e| {
+            if !prune_extension_siblings || !e.file_type().is_dir() {
+                return true;
+            }
+            let under_exthost = e
+                .path()
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|parent| parent.eq_ignore_ascii_case("exthost"));
+            !under_exthost
+                || e.file_name()
+                    .eq_ignore_ascii_case("Tencent-Cloud.coding-copilot")
+        })
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
@@ -375,6 +607,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                     file_name.ends_with(".jsonl") && file_name != "rlm-subagents.jsonl"
                 }
                 "workbuddy.db" => file_name == "workbuddy.db",
+                "studio.db" => file_name == "studio.db",
                 "sessions.db" => file_name == "sessions.db",
                 "state.db" => file_name == "state.db",
                 "threads.db" => file_name == "threads.db",
@@ -1230,6 +1463,9 @@ fn scan_all_clients_with_env_strategy_inner(
     let headless_roots = headless_roots_with_env_strategy(home_dir, use_env_roots);
 
     // Define scan tasks
+    /// Most workers a scan will run, however many cores the machine has.
+    const SCAN_WORKER_CEILING: usize = 4;
+
     let mut tasks: Vec<(ClientId, String, &str)> = Vec::new();
     let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
     let mut devin_cli_roots: Vec<PathBuf> = Vec::new();
@@ -1671,6 +1907,7 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::DevinCli) || enabled.contains(&ClientId::DevinDesktop) {
+        devin_cli_roots.extend(devin_cli_additional_roots(home_dir, use_env_roots));
         let devin_db_path = ClientId::DevinCli
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
@@ -1976,12 +2213,16 @@ fn scan_all_clients_with_env_strategy_inner(
             &mut tasks,
             &mut seen_scan_roots,
             ClientId::Senpi,
-            senpi_path,
+            senpi_path.clone(),
         );
+        let user_state_dir = match omo_task_state(&Path::new(home_dir).join(".omo")) {
+            OmoTaskState::StateDir(path) => Some(path),
+            OmoTaskState::DefaultLayout | OmoTaskState::Unset => None,
+        };
         if use_env_roots {
-            if let Some(path) =
-                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())
-            {
+            let env_session_dir =
+                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty());
+            if let Some(path) = &env_session_dir {
                 push_unique_scan_task(
                     &mut tasks,
                     &mut seen_scan_roots,
@@ -1994,10 +2235,27 @@ fn scan_all_clients_with_env_strategy_inner(
                     &mut tasks,
                     &mut seen_scan_roots,
                     ClientId::Senpi,
-                    current_dir.join(".omo").join("senpi-task").join("children"),
+                    senpi_omo_children_root(&current_dir, user_state_dir.as_deref()),
                 );
             }
+            let mut sessions_roots = vec![PathBuf::from(senpi_path)];
+            if let Some(path) = &env_session_dir {
+                sessions_roots.push(PathBuf::from(path));
+            }
+            for sessions_root in sessions_roots {
+                for path in
+                    discover_senpi_omo_children_roots(&sessions_root, user_state_dir.as_deref())
+                {
+                    push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Senpi, path);
+                }
+            }
         }
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Senpi,
+            senpi_omo_children_root(Path::new(home_dir), user_state_dir.as_deref()),
+        );
     }
 
     if enabled.contains(&ClientId::Gjc) {
@@ -2056,14 +2314,25 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
-    // Execute scans in parallel
-    let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
-        .into_par_iter()
-        .map(|(client_id, path, pattern)| {
-            let files = scan_directory(&path, pattern);
-            (client_id, files)
-        })
-        .collect();
+    let scan = |tasks: Vec<(ClientId, String, &str)>| {
+        tasks
+            .into_par_iter()
+            .map(|(client_id, path, pattern)| {
+                let files = scan_directory(&path, pattern);
+                (client_id, files)
+            })
+            .collect()
+    };
+    let scan_workers = std::thread::available_parallelism()
+        .map_or(2, |cores| cores.get().min(SCAN_WORKER_CEILING));
+    let scan_results: Vec<(ClientId, Vec<PathBuf>)> = match rayon::ThreadPoolBuilder::new()
+        .num_threads(scan_workers)
+        .thread_name(|i| format!("tokmesh-scan-{i}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| scan(tasks)),
+        Err(_) => scan(tasks),
+    };
 
     // Aggregate results, deduplicating file paths across overlapping directories
     let mut seen: HashSet<PathBuf> = HashSet::new();

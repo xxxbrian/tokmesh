@@ -996,6 +996,8 @@ pub enum ClientFilter {
     Mcode,
     Fx,
     Omp,
+    Lmstudio,
+    Unsloth,
     Synthetic,
 }
 
@@ -1056,6 +1058,8 @@ impl ClientFilter {
             Self::Mcode => "mcode",
             Self::Fx => "fx",
             Self::Omp => "omp",
+            Self::Lmstudio => "lmstudio",
+            Self::Unsloth => "unsloth",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1119,6 +1123,8 @@ impl ClientFilter {
             Self::Mcode => Some(ClientId::Mcode),
             Self::Fx => Some(ClientId::Fx),
             Self::Omp => Some(ClientId::Omp),
+            Self::Lmstudio => Some(ClientId::LmStudio),
+            Self::Unsloth => Some(ClientId::Unsloth),
             Self::Synthetic => None,
         }
     }
@@ -1178,6 +1184,8 @@ impl ClientFilter {
             ClientId::Mcode => Self::Mcode,
             ClientId::Fx => Self::Fx,
             ClientId::Omp => Self::Omp,
+            ClientId::LmStudio => Self::Lmstudio,
+            ClientId::Unsloth => Self::Unsloth,
         }
     }
 
@@ -1512,7 +1520,7 @@ where
     F: FnOnce() -> std::io::Result<tokio::runtime::Runtime>,
 {
     match build_runtime() {
-        Ok(rt) => rt.block_on(async { cursor::sync_cursor_cache().await }),
+        Ok(rt) => rt.block_on(async { cursor::sync_cursor_cache(false).await }),
         Err(error) => cursor::SyncCursorResult {
             synced: false,
             rows: 0,
@@ -5647,7 +5655,7 @@ fn run_submit_command(
             println!("{}", "  Syncing Cursor usage data...".bright_black());
         }
         let rt_sync = Runtime::new()?;
-        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache().await });
+        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache(false).await });
         if sync_result.synced && !dry_run_json {
             println!(
                 "{}",
@@ -5854,10 +5862,11 @@ fn run_submit_command(
             }
         }
         Err(err) => {
+            let described = tokmesh_core::pricing::describe_error(&err);
             eprintln!("\n  {}", "Error: Failed to connect to server.".red());
-            eprintln!("{}\n", format!("  {}", err).bright_black());
+            eprintln!("{}\n", format!("  {}", described).bright_black());
             if mode == SubmitMode::Autosubmit {
-                return Err(anyhow::anyhow!("Failed to connect to server: {err}"));
+                return Err(anyhow::anyhow!("Failed to connect to server: {described}"));
             }
             std::process::exit(1);
         }

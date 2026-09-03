@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(dead_code))]
 
 mod amp;
+mod antigravity;
 mod claude;
 pub mod codex;
 mod copilot;
@@ -408,6 +409,11 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
         ),
         ("Codex", codex::has_credentials, codex_fetch),
         ("Z.ai", zai::has_credentials, Fetch::Single(zai::fetch)),
+        (
+            "Antigravity",
+            antigravity::has_credentials,
+            Fetch::Multi(antigravity::fetch_all),
+        ),
         ("Amp", amp::has_credentials, Fetch::Single(amp::fetch)),
         (
             "Copilot",

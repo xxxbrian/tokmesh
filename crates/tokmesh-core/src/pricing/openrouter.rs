@@ -202,7 +202,10 @@ pub async fn fetch_all_models() -> HashMap<String, ModelPricing> {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_error = Some(format!("network error: {}", e));
+                    last_error = Some(format!(
+                        "network error: {}",
+                        crate::pricing::describe_error(&e)
+                    ));
                     if attempt < MAX_RETRIES - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             INITIAL_BACKOFF_MS * (1 << attempt),

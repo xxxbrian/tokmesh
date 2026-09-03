@@ -98,7 +98,7 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
                     "[tokmesh] LiteLLM network error (attempt {}/{}): {}",
                     attempt + 1,
                     MAX_RETRIES,
-                    e
+                    crate::pricing::describe_error(&e)
                 );
                 last_error = Some(e);
                 if attempt < MAX_RETRIES - 1 {

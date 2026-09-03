@@ -23,7 +23,8 @@ use std::time::UNIX_EPOCH;
 // 3: UnifiedMessage gained session_title, changing the bincode payload layout.
 // Old shards must read as Stale (silent rebuild), not Invalid (corruption
 // warning), so the format version moves with the struct.
-const CACHE_FORMAT_VERSION: u32 = 3;
+// 4: OpenCode SQLite entries cache the mark an incremental rescan resumes from.
+const CACHE_FORMAT_VERSION: u32 = 4;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -805,7 +806,8 @@ fn parser_version(client: ClientId) -> u32 {
         // v1->v2: OpenCode gpt-*-fast model ids are canonicalized at grouping
         // and submit identity boundaries; keep the historical invalidation
         // monotonic so old v1 entries never become valid again.
-        ClientId::OpenCode => 2,
+        // v2->v3: sqlite incremental provenance + id-less legacy JSON keys.
+        ClientId::OpenCode => 3,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly.
@@ -878,8 +880,13 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::PrimeAgent => 4,
         // Reasonix fingerprint + family-inference recovery versions.
         ClientId::Reasonix => 4,
+        // v2->v3: usage-events JSON keys sessions by conversationId.
+        ClientId::Cursor => 3,
         // DSH summary-event + fork-dedup versions.
-        ClientId::Dsh => 3,
+        // v3->v4: prefer the concrete model the provider served.
+        // v4->v5: compaction summaries key on compactionId.
+        ClientId::Dsh => 5,
+        ClientId::Unsloth => 2,
         // fx usage-v2 optional total_cost.
         ClientId::Fx => 2,
         // omp shares the pi-format parser (keep in lockstep with Pi bumps).
@@ -937,6 +944,7 @@ pub(crate) struct CachedSourceEntry {
     pub messages: Vec<UnifiedMessage>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub codex_incremental: Option<CodexIncrementalCache>,
+    pub opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
 }
 
 impl CachedSourceEntry {
@@ -956,7 +964,16 @@ impl CachedSourceEntry {
             messages,
             fallback_timestamp_indices,
             codex_incremental,
+            opencode_incremental: None,
         }
+    }
+
+    pub(crate) fn with_opencode_incremental(
+        mut self,
+        incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+    ) -> Self {
+        self.opencode_incremental = incremental;
+        self
     }
 
     fn identity_is_current(&self) -> bool {
@@ -2127,7 +2144,7 @@ mod tests {
 
     #[test]
     fn test_opencode_parser_version_remains_monotonic() {
-        assert_eq!(parser_version(ClientId::OpenCode), 2);
+        assert_eq!(parser_version(ClientId::OpenCode), 3);
     }
 
     #[test]

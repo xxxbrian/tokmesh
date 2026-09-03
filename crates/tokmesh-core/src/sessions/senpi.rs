@@ -4,13 +4,16 @@
 //! delegates to [`super::pi::parse_pi_format_file`]; only the scan root and
 //! client id differ. Two divergences from Pi matter here: `usage.reasoning` is
 //! parsed but never summed, because senpi documents it as a subset of `output`
-//! while tokmesh totals reasoning as its own additive bucket; and
+//! while tokscale totals reasoning as its own additive bucket; and
 //! `session_info.name` carries a human session title rather than Pi's
 //! `subagent-<name>-<id>` marker.
 //!
 //! OmO task children are senpi sessions too. The scanner honors
-//! `SENPI_CODING_AGENT_SESSION_DIR` and discovers the current project's
-//! `.omo/senpi-task/children` tree so their redirected sessions are counted.
+//! `SENPI_CODING_AGENT_SESSION_DIR`, discovers `.omo/senpi-task/children`
+//! under both the supplied home and the current project, and recovers every
+//! other project's children root from the `cwd` recorded in global session
+//! headers, so redirected child sessions are counted no matter where tokscale
+//! runs from.
 
 use super::pi::parse_pi_format_file;
 use super::UnifiedMessage;
@@ -70,7 +73,7 @@ mod tests {
     #[test]
     fn test_parse_senpi_does_not_double_count_reasoning_into_output() {
         // given: senpi documents usage.reasoning as a subset of usage.output,
-        // while tokmesh totals reasoning as its own additive bucket. Mapping
+        // while tokscale totals reasoning as its own additive bucket. Mapping
         // the field through would inflate the total, so it must stay zero and
         // output must stay exactly as reported. `PiUsage` deserializes
         // `reasoning`, so mapping it is a one-line change that this test catches.
