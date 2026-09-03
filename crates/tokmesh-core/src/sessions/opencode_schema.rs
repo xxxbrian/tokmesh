@@ -172,14 +172,14 @@ pub struct OpenCodeSchemaTime {
 // =============================================================================
 
 /// When an embedded `cost` marks a message as carrying a provider-reported
-/// price that tokscale's repricing pass must not overwrite.
+/// price that tokmesh's repricing pass must not overwrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CostProvenance {
     /// Never mark; the client's costs are always re-derived.
     Never,
     /// Mark when the resolved cost is strictly positive. A zero usually means
     /// the client itself had no pricing for the model, so leaving it unmarked
-    /// lets tokscale estimate.
+    /// lets tokmesh estimate.
     WhenPositive,
     /// Mark whenever the payload carried a usable `cost`, including an
     /// explicit `0.0`.
@@ -205,7 +205,7 @@ pub(crate) enum DedupMode {
 /// `parse_opencode_schema_sqlite(db, OpenCodeSchemaConfig::micode())`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenCodeSchemaConfig {
-    /// tokscale client id stamped on every emitted message.
+    /// tokmesh client id stamped on every emitted message.
     pub client: &'static str,
     /// Query groups to run, in order. Within a group the first query that
     /// prepares successfully wins, so a client can offer several schema

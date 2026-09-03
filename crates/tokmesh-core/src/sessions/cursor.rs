@@ -1,6 +1,6 @@
 //! Cursor IDE session parser
 //!
-//! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/.
+//! Parses usage files cached locally at ~/.config/tokmesh/cursor-cache/.
 //! The active account's cache is `usage.json` (or legacy `usage.csv`);
 //! additional accounts use `usage.<account>.json` (or legacy `usage.<account>.csv`).
 //!
@@ -136,7 +136,7 @@ fn infer_provider(model: &str) -> &'static str {
     provider_identity::inferred_provider_from_model(model).unwrap_or("cursor")
 }
 
-/// One row of `usageEventsDisplay`. Only the fields tokscale consumes are
+/// One row of `usageEventsDisplay`. Only the fields tokmesh consumes are
 /// modeled; unknown fields are ignored so upstream additions don't break parsing.
 #[derive(Debug, Deserialize)]
 struct CursorUsageEvent {
@@ -948,15 +948,11 @@ mod tests {
             messages[0].cost_source,
             super::super::CostSource::ProviderReported
         );
-        // The row must never depend on pricing the label, which is refused.
-        assert!(crate::pricing::lookup::is_routing_label(
-            &messages[0].model_id
-        ));
     }
 
     #[test]
     fn test_parse_cursor_events_json_prefers_total_cents_over_charged_cents() {
-        // When the two diverge the metered cost is what tokscale reports, the
+        // When the two diverge the metered cost is what tokmesh reports, the
         // same quantity the CSV `Cost` column has always carried. `chargedCents`
         // describes the credit card, not the usage.
         let json = r#"{

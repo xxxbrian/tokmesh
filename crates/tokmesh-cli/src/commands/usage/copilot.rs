@@ -348,9 +348,7 @@ fn gh_config_dir() -> std::path::PathBuf {
     if cfg!(windows) {
         return std::env::var_os("APPDATA")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-            })
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
             .join("GitHub CLI");
     }
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));

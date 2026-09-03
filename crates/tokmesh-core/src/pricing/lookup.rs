@@ -1211,20 +1211,20 @@ fn should_prefer_openai_tiered_litellm(
 // silently dropping it. cache_read is now required present+valid like
 // input/output, symmetric with them, for this preference decision only.
 fn has_complete_openai_272k_pricing(pricing: &ModelPricing) -> bool {
-    let valid_pair = |base: Option<f64>, above: Option<f64>| {
-        base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
-    };
-
-    valid_pair(
+    has_valid_rate_pair(
         pricing.input_cost_per_token,
         pricing.input_cost_per_token_above_272k_tokens,
-    ) && valid_pair(
+    ) && has_valid_rate_pair(
         pricing.output_cost_per_token,
         pricing.output_cost_per_token_above_272k_tokens,
-    ) && valid_pair(
+    ) && has_valid_rate_pair(
         pricing.cache_read_input_token_cost,
         pricing.cache_read_input_token_cost_above_272k_tokens,
     )
+}
+
+fn has_valid_rate_pair(base: Option<f64>, above: Option<f64>) -> bool {
+    base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
 }
 
 fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
@@ -1245,6 +1245,90 @@ fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Opt
     is_openai_full_request_272k_model(&key)
 }
 
+/// Whether this is a direct xAI Grok row with the complete 200k tariff that
+/// xAI documents as request-wide.
+fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
+    let provider_id = normalize_provider_hint(provider_id);
+    let hinted_xai = provider_id.is_some_and(|provider| {
+        provider_identity::canonical_provider(provider).as_deref() == Some("xai")
+    });
+    if provider_id.is_some() && !hinted_xai {
+        return false;
+    }
+
+    let key = result.matched_key.trim().to_ascii_lowercase();
+    let mut parts = key.split('/');
+    let identifies_xai_grok = match (parts.next(), parts.next(), parts.next()) {
+        (Some(provider), Some(model), None) => {
+            result.source == "LiteLLM"
+                && provider_identity::canonical_provider(provider).as_deref() == Some("xai")
+                && model.starts_with("grok-")
+        }
+        (Some(model), None, None) => {
+            result.source == "Cursor" && hinted_xai && model.starts_with("grok-")
+        }
+        _ => false,
+    };
+    if !identifies_xai_grok {
+        return false;
+    }
+
+    let pricing = &result.pricing;
+    let has_complete_200k_tier = has_valid_rate_pair(
+        pricing.input_cost_per_token,
+        pricing.input_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.output_cost_per_token,
+        pricing.output_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_read_input_token_cost,
+        pricing.cache_read_input_token_cost_above_200k_tokens,
+    );
+    let has_other_context_tier = [
+        pricing.input_cost_per_token_above_128k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+    let has_cache_write_pricing = [
+        pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost_above_200k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+
+    has_complete_200k_tier && !has_other_context_tier && !has_cache_write_pricing
+}
+
+fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakdown) -> f64 {
+    let mut pricing = result.pricing.clone();
+    let prompt_tokens = usage.input.max(0).saturating_add(usage.cache_read.max(0));
+
+    if prompt_tokens >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
+        pricing.input_cost_per_token = pricing.input_cost_per_token_above_200k_tokens;
+        pricing.output_cost_per_token = pricing.output_cost_per_token_above_200k_tokens;
+        pricing.cache_read_input_token_cost = pricing.cache_read_input_token_cost_above_200k_tokens;
+    }
+
+    pricing.input_cost_per_token_above_200k_tokens = None;
+    pricing.output_cost_per_token_above_200k_tokens = None;
+    pricing.cache_read_input_token_cost_above_200k_tokens = None;
+
+    compute_cost(
+        &pricing,
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.reasoning,
+    )
+}
+
 fn compute_cost_for_lookup(
     result: &LookupResult,
     provider_id: Option<&str>,
@@ -1260,6 +1344,10 @@ fn compute_cost_for_lookup(
             usage.reasoning,
         )
     };
+    if uses_xai_full_request_200k_pricing(result, provider_id) {
+        return compute_xai_full_request_200k_cost(result, usage);
+    }
+
     let total_input = usage
         .input
         .max(0)

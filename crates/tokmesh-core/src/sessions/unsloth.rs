@@ -45,7 +45,7 @@ fn provider_for_pricing(provider_type: Option<String>) -> (String, bool) {
         return (provider_type, true);
     }
     if METERED_PROVIDER_TYPES.contains(&provider_type.as_str()) {
-        // Unsloth names the Kimi route by its product brand, while TokScale's
+        // Unsloth names the Kimi route by its product brand, while Tokmesh's
         // metered catalog uses Moonshot AI as the canonical provider.
         let provider = if provider_type == "kimi" {
             "moonshotai".to_string()

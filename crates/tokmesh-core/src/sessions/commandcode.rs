@@ -19,7 +19,7 @@
 //! text), the v3 transcript DOES persist per-request usage and cost. When a
 //! message line carries a `usage` block, its token counts and `costUsd` are
 //! used verbatim and marked provider-reported, so the cost is not overwritten
-//! by tokscale's estimated pricing. The usage buckets are DISJOINT:
+//! by tokmesh's estimated pricing. The usage buckets are DISJOINT:
 //! `inputTokens` is cache-exclusive and `cacheReadTokens`/`cacheWriteTokens`
 //! are billed on top of it — the vendor's own cost arithmetic reproduces the
 //! recorded `costUsd` exactly only when the full `inputTokens` is charged at
@@ -589,7 +589,7 @@ fn content_chars(content: &serde_json::Value) -> usize {
 }
 
 /// Canonicalize the model id for pricing. Command Code reports gateway ids such
-/// as `MiniMaxAI/MiniMax-M3-Free`; the org prefix is not a key tokscale's
+/// as `MiniMaxAI/MiniMax-M3-Free`; the org prefix is not a key tokmesh's
 /// pricing resolver recognizes verbatim, so dropping the org segment yields the
 /// model id (e.g. `MiniMax-M3-Free`) that pricing keys are matched against.
 /// The provider hint that the org segment carried (e.g. `minimax`) is recovered

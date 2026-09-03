@@ -920,7 +920,6 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         )
     }
 
-
     fn load_or_parse_opencode_sqlite_source(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,

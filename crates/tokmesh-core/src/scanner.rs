@@ -2243,13 +2243,10 @@ fn scan_all_clients_with_env_strategy_inner(
                 sessions_roots.push(PathBuf::from(path));
             }
             for sessions_root in sessions_roots {
-                for path in discover_senpi_omo_children_roots(&sessions_root, user_state_dir.as_deref()) {
-                    push_unique_scan_task(
-                        &mut tasks,
-                        &mut seen_scan_roots,
-                        ClientId::Senpi,
-                        path,
-                    );
+                for path in
+                    discover_senpi_omo_children_roots(&sessions_root, user_state_dir.as_deref())
+                {
+                    push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Senpi, path);
                 }
             }
         }

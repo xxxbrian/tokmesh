@@ -1872,12 +1872,6 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    /// #1250: cursor.com serves a bot-protection challenge instead of the API
-    /// response when the ClientHello comes from rustls, so this one client has
-    /// to be on the platform TLS stack while everything else stays on rustls
-    /// via `tokmesh_core::http`.
-    ///
-
     #[test]
     fn test_extract_user_id_from_session_token_with_url_encoding() {
         // Test URL-encoded separator (%3A%3A)

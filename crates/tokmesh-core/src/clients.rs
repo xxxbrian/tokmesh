@@ -1357,7 +1357,11 @@ mod tests {
             ("fx", "/tmp/home/.fx/sessions", "usage-v2.json"),
             ("omp", "/tmp/home/.omp/agent/sessions", "*.jsonl"),
             ("lmstudio", "/tmp/home/.lmstudio/server-logs", "*.log"),
-            ("unsloth", "/tmp/home/.unsloth/studio/studio.db", "studio.db"),
+            (
+                "unsloth",
+                "/tmp/home/.unsloth/studio/studio.db",
+                "studio.db",
+            ),
         ];
         for (id, path, pattern) in cases {
             let client =

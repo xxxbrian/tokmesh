@@ -352,7 +352,7 @@ mod windows_wincred_tests {
         // Deliberately shaped like the go-keyring composition: `base` stands
         // in for the service name and `composed` for what go-keyring actually
         // writes. Reading `base` must fail — that is #1194 in one assertion.
-        let base = format!("tokscale-test:{}:gh", std::process::id());
+        let base = format!("tokmesh-test:{}:gh", std::process::id());
         let composed = format!("{base}:");
         let Some(_guard) = TestCredential::write(&composed, b"gho_wincred_roundtrip") else {
             eprintln!("skipping: CredWriteW was refused on this runner");
@@ -372,7 +372,7 @@ mod windows_wincred_tests {
 
     #[test]
     fn read_wincred_trims_nul_padding_written_by_other_tools() {
-        let target = format!("tokscale-test:{}:padded:", std::process::id());
+        let target = format!("tokmesh-test:{}:padded:", std::process::id());
         let Some(_guard) = TestCredential::write(&target, b"gho_padded\0") else {
             eprintln!("skipping: CredWriteW was refused on this runner");
             return;
@@ -382,7 +382,7 @@ mod windows_wincred_tests {
 
     #[test]
     fn read_wincred_reports_a_missing_target_as_an_error() {
-        let target = format!("tokscale-test:{}:absent:", std::process::id());
+        let target = format!("tokmesh-test:{}:absent:", std::process::id());
         assert!(read_wincred(&target).is_err());
     }
 }

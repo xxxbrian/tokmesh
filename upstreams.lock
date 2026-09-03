@@ -55,6 +55,7 @@ daily_2026_09_03_dsh = "served-model attribution and compaction-id summary keys"
 daily_2026_09_03_scanner = "scan worker ceiling, Code/logs prune, Devin Windows AppData"
 daily_2026_09_03_zai_cli = "CREDIT_LIMIT quota windows and network error cause chains"
 daily_2026_09_03_antigravity_quota = "local language-server subscription quota (not MiniMax summarizer)"
+daily_2026_09_03_pricing = "xAI request-wide 200k long-context rates (retired-model archive not taken wholesale)"
 
 [kept.tokmesh]
 opencode_fast = "OpenCode gpt-*-fast identity (parser_version OpenCode=3 after incremental bump)"

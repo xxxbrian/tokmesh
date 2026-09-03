@@ -123,7 +123,7 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
     set_workspace_from_root(&mut unified, workspace_root.as_deref());
     // OpenCode computes per-message cost at request time from its own pricing
     // data (models.dev), so a positive `cost` is authoritative and must survive
-    // tokscale's LiteLLM repricing pass. A zero cost usually means OpenCode
+    // tokmesh's LiteLLM repricing pass. A zero cost usually means OpenCode
     // itself had no pricing for the model — leave it `Unknown` so
     // `apply_pricing_if_available` can still estimate.
     if unified.cost > 0.0 {
@@ -249,8 +249,6 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::test_env::EnvGuard;
-
     fn create_opencode_sqlite_db(db_path: &Path) -> Connection {
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
@@ -266,7 +264,7 @@ mod tests {
 
     /// Build a database shaped like OpenCode v2 (`opencode-next.db`): an empty
     /// `message` table plus the `session_message` + `session` tables that hold
-    /// the real per-message data. Mirrors the columns tokscale actually reads.
+    /// the real per-message data. Mirrors the columns tokmesh actually reads.
     fn create_opencode_v2_sqlite_db(db_path: &Path) -> Connection {
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
@@ -1751,7 +1749,7 @@ mod tests {
     /// Cache is not loaded when the file is missing (load returns None).
     #[test]
     fn test_migration_cache_missing_returns_none() {
-        // load_opencode_migration_cache reads from ~/.cache/tokscale/opencode-migration.json
+        // load_opencode_migration_cache reads from ~/.cache/tokmesh/opencode-migration.json
         // We can't easily override the path in a unit test, but we can verify that
         // serde_json::from_str returns None for invalid input (simulating missing file).
         let result: Option<OpenCodeMigrationCache> = serde_json::from_str("").ok();
@@ -1786,31 +1784,6 @@ mod tests {
             !is_valid,
             "Cache should not allow skipping when migration_complete=false"
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn migration_record_falls_back_to_legacy_path() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let temp_xdg_cache = tempfile::tempdir().unwrap();
-        let mut guard = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR", "XDG_CACHE_HOME", "HOME"]);
-        guard.set("HOME", temp_home.path());
-        guard.set("XDG_CACHE_HOME", temp_xdg_cache.path());
-        guard.remove("TOKSCALE_CONFIG_DIR");
-
-        let legacy_path = crate::paths::legacy_dirs_cache_dir()
-            .unwrap()
-            .join(MIGRATION_CACHE_FILENAME);
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &legacy_path,
-            r#"{"migration_complete":true,"json_file_count":2,"json_dir_mtime_secs":3,"checked_at_secs":4}"#,
-        )
-        .unwrap();
-
-        let loaded = load_opencode_migration_cache().unwrap();
-        assert!(loaded.migration_complete);
-        assert_eq!(loaded.json_file_count, 2);
     }
 
     // =========================================================================

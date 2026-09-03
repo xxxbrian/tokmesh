@@ -73,7 +73,7 @@ pub fn has_credentials() -> bool {
 }
 
 /// Translate Z.ai's limit windows into the session/weekly/web-search metrics
-/// tokscale surfaces.
+/// tokmesh surfaces.
 ///
 /// Z.ai encodes each window as an opaque `(unit, number)` code pair rather than
 /// a name: `(3, 5)` is the 5-hour rolling session window and `(6, 1)` is the
