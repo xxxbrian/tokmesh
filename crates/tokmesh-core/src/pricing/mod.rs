@@ -64,12 +64,13 @@ impl PricingService {
     ) -> Self {
         Self {
             custom,
-            lookup: PricingLookup::new_with_models_dev(
+            lookup: PricingLookup::new_with_archive(
                 litellm_data,
                 openrouter_data,
                 Self::build_cursor_overrides(),
                 Self::build_sakana_overrides(),
                 models_dev_data,
+                Self::build_archive_overrides(),
             ),
         }
     }
@@ -78,6 +79,34 @@ impl PricingService {
     // explains *why* these entries are dropped, not just *what* the code does.
     /// Filter out LiteLLM entries from subscription-based providers (e.g. github_copilot/)
     /// whose $0.00 pricing is meaningless for per-token cost estimation.
+
+    fn build_archive_overrides() -> HashMap<String, ModelPricing> {
+        type ArchivedRateRow = (&'static str, f64, f64, f64, f64);
+        let entries: &[ArchivedRateRow] = &[
+            ("anthropic/claude-haiku-4-5", 1e-6, 5e-6, 1e-7, 1.25e-6),
+            ("anthropic/claude-sonnet-4-5", 3e-6, 1.5e-5, 3e-7, 3.75e-6),
+            ("anthropic/claude-sonnet-4-6", 3e-6, 1.5e-5, 3e-7, 3.75e-6),
+            ("anthropic/claude-opus-4-5", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+            ("anthropic/claude-opus-4-6", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+            ("anthropic/claude-opus-4-7", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+            ("anthropic/claude-opus-4-8", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+        ];
+        let mut overrides = HashMap::with_capacity(entries.len());
+        for (model_id, input, output, cache_read, cache_creation) in entries {
+            overrides.insert(
+                model_id.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(*input),
+                    output_cost_per_token: Some(*output),
+                    cache_read_input_token_cost: Some(*cache_read),
+                    cache_creation_input_token_cost: Some(*cache_creation),
+                    ..Default::default()
+                },
+            );
+        }
+        overrides
+    }
+
     fn filter_litellm_data(
         mut data: HashMap<String, ModelPricing>,
     ) -> HashMap<String, ModelPricing> {

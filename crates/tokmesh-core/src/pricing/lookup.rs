@@ -116,6 +116,8 @@ pub struct PricingLookup {
     litellm_key_parts: Vec<KeyModelPart>,
     openrouter_key_parts: Vec<KeyModelPart>,
     models_dev_key_parts: Vec<KeyModelPart>,
+    archive: HashMap<String, ModelPricing>,
+    archive_key_parts: Vec<KeyModelPart>,
     litellm_lower: HashMap<String, String>,
     openrouter_lower: HashMap<String, String>,
     models_dev_lower: HashMap<String, String>,
@@ -150,6 +152,24 @@ impl PricingLookup {
         cursor: HashMap<String, ModelPricing>,
         sakana: HashMap<String, ModelPricing>,
         models_dev: HashMap<String, ModelPricing>,
+    ) -> Self {
+        Self::new_with_archive(
+            litellm,
+            openrouter,
+            cursor,
+            sakana,
+            models_dev,
+            HashMap::new(),
+        )
+    }
+
+    pub fn new_with_archive(
+        litellm: HashMap<String, ModelPricing>,
+        openrouter: HashMap<String, ModelPricing>,
+        cursor: HashMap<String, ModelPricing>,
+        sakana: HashMap<String, ModelPricing>,
+        models_dev: HashMap<String, ModelPricing>,
+        archive: HashMap<String, ModelPricing>,
     ) -> Self {
         let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
         litellm_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
@@ -235,7 +255,11 @@ impl PricingLookup {
 
         let litellm_key_parts = build_key_parts(&litellm_keys);
         let openrouter_key_parts = build_key_parts(&openrouter_keys);
+        let mut archive_keys: Vec<String> = archive.keys().cloned().collect();
+        archive_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+
         let models_dev_key_parts = build_key_parts(&models_dev_keys);
+        let archive_key_parts = build_key_parts(&archive_keys);
 
         Self {
             litellm,
@@ -243,6 +267,8 @@ impl PricingLookup {
             cursor,
             sakana,
             models_dev,
+            archive,
+            archive_key_parts,
             litellm_keys,
             openrouter_keys,
             litellm_key_parts,
@@ -331,7 +357,7 @@ impl PricingLookup {
         // so for pricing lookup we resolve to the base model regardless of tier.
         // Mirrors the dash-suffix path (e.g. `-xhigh`), which is handled by
         // `try_strip_unknown_suffix` below.
-        let normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
+        let tier_normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
 
         // Guard against silent misresolution: if the input ends with `(...)`
         // but the contents are not a recognized CLIProxyAPI level, refuse the
@@ -339,7 +365,7 @@ impl PricingLookup {
         // `-` and could match a shorter, unrelated model id by peeling the
         // parenthesized fragment off (e.g. `gpt-5.2-codex(invalid)` would
         // strip `-codex(invalid)` and resolve to `gpt-5.2`).
-        if normalized_owned.is_none()
+        if tier_normalized_owned.is_none()
             && lower
                 .strip_suffix(')')
                 .and_then(|inner| inner.rsplit_once('('))
@@ -348,7 +374,11 @@ impl PricingLookup {
             return None;
         }
 
-        let lower_ref: &str = normalized_owned.as_deref().unwrap_or(&lower);
+        let tier_normalized_ref = tier_normalized_owned.as_deref().unwrap_or(&lower);
+        let fast_normalized_owned = normalize_openai_fast_mode(tier_normalized_ref, provider_id);
+        let lower_ref = fast_normalized_owned
+            .as_deref()
+            .unwrap_or(tier_normalized_ref);
 
         // Helper to perform lookup with the given source constraint
         let do_lookup = |id: &str| match force_source {
@@ -626,6 +656,10 @@ impl PricingLookup {
             if let Some(result) = self.exact_match_sakana(&version_normalized) {
                 return Some(result);
             }
+        }
+
+        if let Some(result) = self.exact_match_archive(model_id, provider_id) {
+            return Some(result);
         }
 
         if !is_fuzzy_eligible(model_id) {
@@ -993,6 +1027,38 @@ impl PricingLookup {
             }
         }
         None
+    }
+
+    fn exact_match_archive(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if self.archive.is_empty() {
+            return None;
+        }
+        let lower = model_id.trim().to_ascii_lowercase();
+        let canonical = normalize_model_name(&lower)?;
+        let embedded_root = lower.split_once('/').map(|(root, _)| root);
+        let hint = provider_id.or(embedded_root);
+        match hint {
+            Some(hint) => exact_match_with_provider_prefixes(
+                &canonical,
+                Some(hint),
+                &self.archive_key_parts,
+                &self.archive,
+                "Archive",
+            ),
+            None => {
+                let matches: Vec<&String> = self
+                    .archive_key_parts
+                    .iter()
+                    .filter(|kp| model_part_matches_exact(&kp.lower_model_part, &canonical))
+                    .map(|kp| &kp.key)
+                    .collect();
+                select_best_match(&matches, &self.archive, "Archive", None)
+            }
+        }
     }
 
     fn prefix_match_litellm(
@@ -2332,6 +2398,28 @@ fn provider_prefix_matches_scoped_provider(prefix: &str, scoped_tags: &[String])
     provider_identity::provider_tags(prefix.trim_end_matches('/'))
         .iter()
         .any(|prefix_tag| scoped_tags.iter().any(|scoped| scoped == prefix_tag))
+}
+
+
+fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
+    if provider_id
+        .and_then(provider_identity::canonical_provider)
+        .as_deref()
+        != Some("openai")
+    {
+        return None;
+    }
+    let (prefix, terminal) = model_id
+        .rsplit_once('/')
+        .map_or((None, model_id), |(prefix, terminal)| (Some(prefix), terminal));
+    let base = terminal.strip_suffix("-fast")?;
+    if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
+        return None;
+    }
+    Some(match prefix {
+        Some(prefix) => format!("{prefix}/{base}"),
+        None => base.to_string(),
+    })
 }
 
 fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
