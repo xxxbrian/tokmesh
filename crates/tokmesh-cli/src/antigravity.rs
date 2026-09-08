@@ -525,6 +525,14 @@ impl CacheOperationLockGuard {
     }
 }
 
+impl Drop for CacheOperationLockGuard {
+    fn drop(&mut self) {
+        // A concurrent fork may retain the open file description until exec.
+        // Closing our descriptor alone would keep the lock held in that child.
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 impl SyncLockGuard {
     /// Take exclusive ownership of the Antigravity sync for as long as the
     /// returned guard lives.
@@ -692,6 +700,9 @@ impl Drop for SyncLockGuard {
         if std::fs::read_to_string(&self.path).ok().as_deref() == Some(&self.record) {
             let _ = fs::remove_file(&self.path);
         }
+        // Release the inner lock before the cache-operation guard is dropped.
+        // Explicit unlock also releases it when a fork retained a descriptor.
+        let _ = FileExt::unlock(&self._os_file);
     }
 }
 
@@ -5366,6 +5377,25 @@ mod tests {
         drop(guard);
         SyncLockGuard::acquire(&cache_dir)
             .expect("the lock must be free once the guard is dropped");
+    }
+
+    #[test]
+    fn sync_lock_release_does_not_wait_for_duplicate_handles_to_close() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let owner = SyncLockGuard::acquire(&cache_dir).unwrap();
+        // A fork can briefly retain these open file descriptions before exec.
+        let inherited_cache_lock = owner._cache_lock._file.try_clone().unwrap();
+        let inherited_sync_lock = owner._os_file.try_clone().unwrap();
+        assert!(SyncLockGuard::acquire(&cache_dir).is_err());
+
+        drop(owner);
+        assert!(!cache_dir.join("sync.lock").exists());
+        let successor = SyncLockGuard::acquire(&cache_dir)
+            .expect("a finished sync must release both locks despite inherited handles");
+        drop((inherited_cache_lock, inherited_sync_lock));
+        assert!(SyncLockGuard::acquire(&cache_dir).is_err());
+        drop(successor);
     }
 
     /// A contender must take the companion lock before publishing the legacy
