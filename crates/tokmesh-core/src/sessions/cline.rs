@@ -6,7 +6,7 @@
 //! - **VS Code extension** (`saoudrizwan.claude-dev`): one
 //!   `ui_messages.json` per task under VS Code globalStorage. Cline is the
 //!   upstream Roo Code / Kilo forked from, so this layout is shared and
-//!   handled by [`roocode::parse_roo_kilo_file`].
+//!   handled by `roocode::parse_roo_kilo_file`.
 //! - **Cline CLI / desktop** (`~/.cline/data/sessions/<id>/`): a
 //!   `<id>.messages.json` transcript plus a sibling `<id>.json` manifest. This
 //!   is the newer standalone runtime and is handled locally below.

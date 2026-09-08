@@ -10,6 +10,7 @@ mod minutely;
 mod models;
 mod monthly;
 mod overview;
+mod projects;
 mod sessions;
 pub mod spinner;
 mod stats;
@@ -20,6 +21,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::app::{App, Tab};
+use crate::tui::ui::widgets::AMBIENT_STABLE_BORDER_SET;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -55,6 +57,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Tab::Minutely => minutely::render(frame, app, chunks[1]),
             Tab::Monthly => monthly::render(frame, app, chunks[1]),
             Tab::Sessions => sessions::render(frame, app, chunks[1]),
+            Tab::Projects => projects::render(frame, app, chunks[1]),
             Tab::Stats => stats::render(frame, app, chunks[1]),
             Tab::Usage => usage::render(frame, app, chunks[1]),
         }
@@ -70,6 +73,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_loading(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 
@@ -101,6 +105,7 @@ fn render_loading(frame: &mut Frame, app: &App, area: Rect) {
 fn render_error(frame: &mut Frame, app: &App, area: Rect, error: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 

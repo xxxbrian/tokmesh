@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 const DEFAULT_PROVIDER: &str = "tencent";
+pub(crate) const TENCENT_BUDDY_PARSER_BASE_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 struct BuddyLine {

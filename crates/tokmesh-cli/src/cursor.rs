@@ -589,10 +589,9 @@ fn load_credentials_store_from_home(home_dir: &Path) -> Option<CursorCredentials
                 }
             }
             if changed || read_path != path {
-                let _ = save_credentials_store_in_home(home_dir, &store);
-            }
-            if read_path != path {
-                let _ = fs::remove_file(old_cursor_credentials_path(home_dir));
+                if save_credentials_store_in_home(home_dir, &store).is_ok() && read_path != path {
+                    let _ = fs::remove_file(old_cursor_credentials_path(home_dir));
+                }
             }
             return Some(store);
         }
@@ -608,8 +607,7 @@ fn load_credentials_store_from_home(home_dir: &Path) -> Option<CursorCredentials
             accounts,
         };
 
-        let _ = save_credentials_store_in_home(home_dir, &migrated);
-        if read_path != path {
+        if save_credentials_store_in_home(home_dir, &migrated).is_ok() && read_path != path {
             let _ = fs::remove_file(old_cursor_credentials_path(home_dir));
         }
         return Some(migrated);
@@ -1871,6 +1869,25 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    #[test]
+    fn failed_migration_keeps_original_credentials() {
+        let home = TempDir::new().unwrap();
+        let old = old_cursor_credentials_path(home.path());
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, r#"{"version":1,"activeAccountId":"user123","accounts":{"user123":{"sessionToken":"user123::fixture-only","createdAt":"2026-09-08T00:00:00Z"}}}"#).unwrap();
+        fs::create_dir_all(home.path().join(".config")).unwrap();
+        fs::write(
+            home.path().join(".config/tokmesh"),
+            "blocks destination directory",
+        )
+        .unwrap();
+        assert!(load_credentials_store_from_home(home.path()).is_some());
+        assert!(
+            old.exists(),
+            "failed migration deleted the only credential file"
+        );
+    }
 
     #[test]
     fn test_extract_user_id_from_session_token_with_url_encoding() {

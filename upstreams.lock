@@ -6,25 +6,23 @@
 
 [tokscale]
 repo = "https://github.com/junhoyeo/tokscale"
-commit = "e80db478af11408c6dd3436e40dee9e7c0d84a23"
-# Package version stays the lock pin (4.7.0), not tokmesh 0.1.3 or tokscale 4.15.0.
-# Last in-scope commit ported: Cursor cache-move follow-up. Later tokscale
-# commits in the window (Hindsight, native-tls, submit fold, website/CI/moderation)
-# were reviewed and not taken.
+commit = "15516420f2b106750760f6e182559899f814e2dc"
+# Protocol version remains pinned independently of the reviewed upstream tip.
+# See UPSTREAM_SYNC.md for adopted changes and exclusions.
 version = "4.7.0"
-subject = "fix(cursor): stop discarding failed cache moves on account switch (#1258)"
+subject = "fix(submit): reconcile Droid snapshot costs across days (#1311)"
 role = "local-baseline"
-reviewed = "2026-09-03"
+reviewed = "2026-09-08"
 
 [tokens]
 repo = "https://github.com/missuo/tokens"
-commit = "75aba190695c9de5f2695d9baba6afd3c8cb63f8"
+commit = "f114057f33c64b3e86539aa56d5dfde9964ae8e7"
 # Package version at that commit. Submit to tokens.ci reports this as meta.version.
 # Files were copied from this HEAD (Grok unified dual-write itself is skipped).
 version = "27.0.1"
-subject = "Revert Merge pull request #56 from thedavidweng/fix/grok-unified-log"
+subject = "Merge pull request #65 from SHLE1/fix/gpt-6-astra-standard-pricing"
 role = "submit-hardening-and-parser-picks"
-reviewed = "2026-09-03"
+reviewed = "2026-09-08"
 
 [adopted.tokens]
 bucket_tz = "pinned IANA date bucketing"
@@ -44,6 +42,7 @@ daily_2026_08_27_cli = "ClientFilter variants including NineRouter->Gjc, TUI dis
 daily_2026_08_27_pricing_aliases = "kimi-for-coding, k2d6-agent/k3-agent, minimax-m3, daybreak-blue, claude-opus-4-0/claude-opus-41"
 daily_2026_08_27_copilot = "copilot.rs for_each_json_line + desktop/vscode full chain"
 daily_2026_08_27_hang = "lossy_lines / for_each_json_line / sqlite_for_each_row_on (kimi, copilot, synthetic, grok)"
+daily_2026_09_08_pricing = "GPT-6 Astra/Pro 272k request-wide rates; OpenRouter Standard/Flex/Fast/Batch endpoint selection"
 daily_2026_09_03_lmstudio = "LM Studio server-logs parser"
 daily_2026_09_03_unsloth = "Unsloth Studio sqlite parser, including metered provider pricing"
 daily_2026_09_03_commandcode_v3 = "Command Code v3 authoritative on-disk usage and cost"
@@ -56,9 +55,16 @@ daily_2026_09_03_scanner = "scan worker ceiling, Code/logs prune, Devin Windows 
 daily_2026_09_03_zai_cli = "CREDIT_LIMIT quota windows and network error cause chains"
 daily_2026_09_03_antigravity_quota = "local language-server subscription quota (not MiniMax summarizer)"
 daily_2026_09_03_pricing = "xAI request-wide 200k long-context rates (retired-model archive not taken wholesale)"
+daily_2026_09_08_openclaw = "per-agent SQLite/WAL, compressed archives, checkpoint exclusion, per-turn Codex ownership and mirror dedup"
+daily_2026_09_08_antigravity = "gen9 timestamp and model attribution prerequisites, bounded concurrent quota discovery, RPC runtime isolation and cached timestamp preservation"
+daily_2026_09_08_copilot = "single-pass CLI export parser"
+daily_2026_09_08_projects = "cross-client Projects tab, workspace labels and worktree grouping helpers, Kimi Code workspace indexes"
+daily_2026_09_08_tui = "CJK-width-safe borders and truncation; persistent light theme"
+daily_2026_09_08_pricing = "stealth preview aliases and first-party Zhipu/Xiaomi/Tencent archive tariffs"
+daily_2026_09_08_cache = "shared format-owner versions; Codex coverage schema invalidation; OpenCode equal-millisecond boundary rescan"
 
 [kept.tokmesh]
-opencode_fast = "OpenCode gpt-*-fast identity (parser_version OpenCode=3 after incremental bump)"
+opencode_fast = "raw Fast tariffs take precedence; canonical report/submit identity kept; parser_version OpenCode=4"
 grok_build = "Grok -build model identity; grok parser stays updates.jsonl (no unified dual-source)"
 rustls = "reqwest rustls-tls, no native-tls"
 hermes_per_model = true

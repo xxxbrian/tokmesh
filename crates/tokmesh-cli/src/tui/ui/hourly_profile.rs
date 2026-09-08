@@ -1,13 +1,14 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::widgets::{format_cost, format_tokens};
+use super::widgets::{format_cost, format_tokens, AMBIENT_STABLE_BORDER_SET};
 use crate::tui::app::App;
 use crate::tui::data::{aggregate_by_period, aggregate_by_weekday, find_peak_hour};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Hourly Profile ",
@@ -73,14 +74,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Summary line
     let summary_spans = vec![
-        Span::styled(
-            format!("{} hours", hourly.len()),
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled(format!("{} hours", hourly.len()), app.theme.count_style()),
         Span::styled("  |  ", Style::default().fg(app.theme.muted)),
         Span::styled(
             format!("{} total tokens", format_tokens(total_tokens)),
-            Style::default().fg(Color::Cyan),
+            app.theme.count_style(),
         ),
         Span::styled("  |  ", Style::default().fg(app.theme.muted)),
         Span::styled(
@@ -131,10 +129,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("  ", Style::default()),
             Span::styled(bar, Style::default().fg(Color::Green)),
             Span::styled("  ", Style::default()),
-            Span::styled(
-                format!("{:>5.1}%", percentage),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(format!("{:>5.1}%", percentage), app.theme.hint_key_style()),
         ]));
     }
     lines.push(Line::from(""));
@@ -180,17 +175,14 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(
                 format!("  {:<10}", weekday.day),
                 Style::default().fg(if is_best {
-                    Color::Yellow
+                    app.theme.hint_key_color()
                 } else {
                     app.theme.foreground
                 }),
             ),
             Span::styled(bar, Style::default().fg(Color::Green)),
             Span::styled("  ", Style::default()),
-            Span::styled(
-                format!("{:>5.1}%", percentage),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(format!("{:>5.1}%", percentage), app.theme.hint_key_style()),
         ]));
     }
     lines.push(Line::from(""));
@@ -206,10 +198,10 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::styled(
                 format!("{:02}:00-{:02}:59", hour, hour),
-                Style::default().fg(Color::Yellow),
+                app.theme.hint_key_style(),
             ),
             Span::styled("  (", Style::default().fg(app.theme.muted)),
-            Span::styled(format_tokens(tokens), Style::default().fg(Color::Cyan)),
+            Span::styled(format_tokens(tokens), app.theme.count_style()),
             Span::styled(" tokens, ", Style::default().fg(app.theme.muted)),
             Span::styled(format_cost(cost), Style::default().fg(Color::Green)),
             Span::styled(")", Style::default().fg(app.theme.muted)),
@@ -230,7 +222,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("Press ", Style::default().fg(app.theme.muted)),
-        Span::styled("[v]", Style::default().fg(Color::Yellow)),
+        Span::styled("[v]", app.theme.hint_key_style()),
         Span::styled(
             " to switch to table view",
             Style::default().fg(app.theme.muted),

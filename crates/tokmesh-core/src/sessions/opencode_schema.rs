@@ -1582,7 +1582,9 @@ pub(crate) fn rescan_opencode_schema_sqlite(
 
             if old_index < mark.rows.len() && mark.rows[old_index].row_id == row.row_id {
                 let old = &mark.rows[old_index];
-                if old.updated_at == row.updated_at {
+                // A timestamp is not a revision: writes within the boundary
+                // millisecond must be parsed again even if their marker agrees.
+                if old.updated_at == row.updated_at && row.updated_at < mark.updated_high_water {
                     row.message_key = old.message_key.clone();
                 } else {
                     if old
@@ -1613,8 +1615,8 @@ pub(crate) fn rescan_opencode_schema_sqlite(
 
         let query = incremental.queries.get(chosen)?;
         if !collect_rows_since(db_path, &conn, query, mark.updated_high_water, &mut |row| {
-            // Inclusive boundary rows are intentionally re-read by SQL. Their
-            // per-row marker proves they did not change, so they need no merge.
+            // Boundary rows are included in expected_changed even when their
+            // millisecond marker agrees with the cached inventory.
             let Some(&row_slot) = expected_changed.get(&row.row_id) else {
                 if rows
                     .binary_search_by(|candidate| candidate.row_id.cmp(&row.row_id))

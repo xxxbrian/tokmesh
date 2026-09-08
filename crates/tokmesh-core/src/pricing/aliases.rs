@@ -3,6 +3,26 @@ use std::collections::HashMap;
 
 static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
+    // Stealth preview shorthands for the August 2026 Z.AI GLM-5.3-Flash free
+    // preview. Sessions record the bare `ox-alpha` (and the router-qualified
+    // `stealth/ox-alpha` gateways emit), while upstream models.dev tracks the
+    // canonical free incarnations `opencode-go/ox-alpha-free` and
+    // `opencode/x-preview-f-free` at $0.00 (both deprecated). Pin the
+    // shorthand spellings to those canonical keys -- the same "canonical
+    // first-party key" pattern as `minimax-m3` above -- so the live upstream
+    // $0 row prices them instead of an unverified reseller guess. The
+    // qualified `stealth/` form must be explicit because provider-prefix
+    // stripping does not run alias resolution a second time.
+    // Sources (accessed 2026-09-03):
+    // https://openrouter.ai/stealth/ox-alpha ("free to use", ZAI reveal)
+    // https://docs.z.ai/guides/vlm/glm-5.3-flash ("tested anonymously as ox-alpha")
+    // https://models.dev/api.json (providers.opencode.models.x-preview-f-free
+    // and providers.opencode-go.models.ox-alpha-free at input = 0,
+    // output = 0, cache_read = 0, both deprecated)
+    m.insert("ox-alpha", "opencode-go/ox-alpha-free");
+    m.insert("stealth/ox-alpha", "opencode-go/ox-alpha-free");
+    m.insert("x-preview-f-free", "opencode/x-preview-f-free");
+
     m.insert("big-pickle", "glm-4.7");
     m.insert("big pickle", "glm-4.7");
     m.insert("bigpickle", "glm-4.7");

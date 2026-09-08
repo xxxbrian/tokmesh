@@ -7,6 +7,10 @@
 
 pub use tokmesh_core::paths::{get_cache_dir, get_config_dir};
 
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

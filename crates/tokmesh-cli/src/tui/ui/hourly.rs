@@ -1,8 +1,7 @@
+use super::widgets::{ambient_stable_scrollbar, AMBIENT_STABLE_BORDER_SET};
 use chrono::{NaiveDate, Timelike};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::hourly_profile;
 use super::widgets::{
@@ -21,6 +20,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Hourly Usage ",
@@ -79,12 +79,12 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else if has_turn_data {
         vec![
-            "Hour", "Source", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×",
+            "Hour", "Source", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕",
             "Total", "Cost", "Cost/1M",
         ]
     } else {
         vec![
-            "Hour", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×", "Total",
+            "Hour", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕", "Total",
             "Cost", "Cost/1M",
         ]
     };
@@ -92,8 +92,8 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -201,9 +201,7 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let time_str = hour.datetime.format("%H:00").to_string();
         let time_style = if is_current {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            app.theme.hint_key_style().add_modifier(Modifier::BOLD)
         } else if !is_narrow && !is_very_narrow {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
@@ -248,7 +246,7 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     hour.tokens.input,
                     hour.tokens.cache_write,
                 ))
-                .style(Style::default().fg(Color::Cyan)),
+                .style(app.theme.count_style()),
                 total_tokens_cell(hour.tokens.total(), &app.theme),
                 Cell::from(format_cost(hour.cost)).style(Style::default().fg(Color::Green)),
                 Cell::from(format_cost_per_million(hour.cost, hour.tokens.total()))
@@ -335,9 +333,7 @@ fn render_table(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if hourly_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(hourly_len, scroll_offset, data_rows_shown);

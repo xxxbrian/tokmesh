@@ -24,7 +24,8 @@ use std::time::UNIX_EPOCH;
 // Old shards must read as Stale (silent rebuild), not Invalid (corruption
 // warning), so the format version moves with the struct.
 // 4: OpenCode SQLite entries cache the mark an incremental rescan resumes from.
-const CACHE_FORMAT_VERSION: u32 = 4;
+// 5: Codex incremental state records OpenClaw ownership and per-turn coverage.
+const CACHE_FORMAT_VERSION: u32 = 5;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -798,16 +799,36 @@ impl CacheIdentity {
 }
 
 fn parser_version(client: ClientId) -> u32 {
+    let pi_base = crate::sessions::pi::PI_FORMAT_PARSER_BASE_VERSION;
+    match client {
+        ClientId::Pi => return pi_base + 2,
+        ClientId::Kimchi => return pi_base + 1,
+        ClientId::Omp | ClientId::Senpi => return pi_base,
+        ClientId::PrimeAgent => return pi_base + 3,
+        ClientId::Codebuff | ClientId::Freebuff => {
+            return crate::sessions::codebuff::CODEBUFF_CHAT_PARSER_BASE_VERSION;
+        }
+        ClientId::RooCode | ClientId::KiloCode | ClientId::Cline => {
+            return crate::sessions::roocode::ROO_KILO_TASK_LOG_PARSER_BASE_VERSION;
+        }
+        ClientId::CodeBuddy | ClientId::WorkBuddy => {
+            return crate::sessions::tencent_buddy::TENCENT_BUDDY_PARSER_BASE_VERSION;
+        }
+        _ => {}
+    }
     match client {
         // These clients accumulated parser-only invalidations under the old
         // global schema. Their independent counters start from those histories
         // so future changes have an obvious local version to increment.
-        ClientId::Codex => 6,
+        ClientId::Codex => 7,
         // v1->v2: OpenCode gpt-*-fast model ids are canonicalized at grouping
         // and submit identity boundaries; keep the historical invalidation
         // monotonic so old v1 entries never become valid again.
         // v2->v3: sqlite incremental provenance + id-less legacy JSON keys.
-        ClientId::OpenCode => 3,
+        ClientId::OpenCode => 4,
+        ClientId::OpenClaw => 2,
+        ClientId::LmStudio => 2,
+        ClientId::AntigravityCli => 2,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly.
@@ -825,7 +846,7 @@ fn parser_version(client: ClientId) -> u32 {
         // shared identity, and a valid span_id alone (no trace_id) is now a
         // stable dedup key instead of falling through to the line-index key.
         // v7->v8: stabilize duplicate agent attribution and partial timing boundaries.
-        ClientId::Copilot => 9,
+        ClientId::Copilot => 10,
         // Pi subagent sessions now derive agent attribution from session_info
         // names; version-1 caches carry those messages without agent metadata.
         ClientId::Pi => 3,
@@ -1652,6 +1673,47 @@ pub(crate) fn codex_cache_entry_matches_fingerprint(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_parser_versions_follow_their_format_owner() {
+        use crate::sessions::{codebuff, pi, roocode, tencent_buddy};
+        for (client, expected) in [
+            (ClientId::Pi, pi::PI_FORMAT_PARSER_BASE_VERSION + 2),
+            (ClientId::Kimchi, pi::PI_FORMAT_PARSER_BASE_VERSION + 1),
+            (ClientId::Omp, pi::PI_FORMAT_PARSER_BASE_VERSION),
+            (ClientId::Senpi, pi::PI_FORMAT_PARSER_BASE_VERSION),
+            (ClientId::PrimeAgent, pi::PI_FORMAT_PARSER_BASE_VERSION + 3),
+            (
+                ClientId::Codebuff,
+                codebuff::CODEBUFF_CHAT_PARSER_BASE_VERSION,
+            ),
+            (
+                ClientId::Freebuff,
+                codebuff::CODEBUFF_CHAT_PARSER_BASE_VERSION,
+            ),
+            (
+                ClientId::RooCode,
+                roocode::ROO_KILO_TASK_LOG_PARSER_BASE_VERSION,
+            ),
+            (
+                ClientId::KiloCode,
+                roocode::ROO_KILO_TASK_LOG_PARSER_BASE_VERSION,
+            ),
+            (
+                ClientId::Cline,
+                roocode::ROO_KILO_TASK_LOG_PARSER_BASE_VERSION,
+            ),
+            (
+                ClientId::CodeBuddy,
+                tencent_buddy::TENCENT_BUDDY_PARSER_BASE_VERSION,
+            ),
+            (
+                ClientId::WorkBuddy,
+                tencent_buddy::TENCENT_BUDDY_PARSER_BASE_VERSION,
+            ),
+        ] {
+            assert_eq!(parser_version(client), expected, "{client:?}");
+        }
+    }
     use super::*;
     use crate::TokenBreakdown;
     use std::io::Write;
@@ -2101,13 +2163,13 @@ mod tests {
 
     #[test]
     fn test_codex_duration_parser_version_invalidates_v4_entries() {
-        assert_eq!(parser_version(ClientId::Codex), 6);
+        assert_eq!(parser_version(ClientId::Codex), 7);
         assert_eq!(parser_version(ClientId::Claude), 3);
     }
 
     #[test]
     fn test_copilot_duplicate_metadata_parser_version_invalidates_v7_entries() {
-        assert_eq!(parser_version(ClientId::Copilot), 9);
+        assert_eq!(parser_version(ClientId::Copilot), 10);
     }
 
     #[test]
@@ -2144,7 +2206,7 @@ mod tests {
 
     #[test]
     fn test_opencode_parser_version_remains_monotonic() {
-        assert_eq!(parser_version(ClientId::OpenCode), 3);
+        assert_eq!(parser_version(ClientId::OpenCode), 4);
     }
 
     #[test]

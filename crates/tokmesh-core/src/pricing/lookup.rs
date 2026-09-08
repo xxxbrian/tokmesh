@@ -374,11 +374,7 @@ impl PricingLookup {
             return None;
         }
 
-        let tier_normalized_ref = tier_normalized_owned.as_deref().unwrap_or(&lower);
-        let fast_normalized_owned = normalize_openai_fast_mode(tier_normalized_ref, provider_id);
-        let lower_ref = fast_normalized_owned
-            .as_deref()
-            .unwrap_or(tier_normalized_ref);
+        let lower_ref = tier_normalized_owned.as_deref().unwrap_or(&lower);
 
         // Helper to perform lookup with the given source constraint
         let do_lookup = |id: &str| match force_source {
@@ -409,6 +405,14 @@ impl PricingLookup {
                 return None;
             }
             return Some(result);
+        }
+
+        // Keep a dedicated Fast tariff when one exists. Normalizing model
+        // identity for reports must not preempt the raw pricing lookup.
+        if let Some(base) = normalize_openai_fast_mode(lower_ref, provider_id) {
+            if let Some(result) = do_lookup(&base) {
+                return Some(result);
+            }
         }
 
         if parse_provider_scoped_model_path(lower_ref).is_some() {
@@ -544,6 +548,9 @@ impl PricingLookup {
         // matching key falls through to the canonical resolution below.
         if provider_id.is_some() {
             if let Some(result) = self.exact_match_models_dev_for_provider(model_id, provider_id) {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_archive(model_id, provider_id) {
                 return Some(result);
             }
         }
@@ -1038,7 +1045,8 @@ impl PricingLookup {
             return None;
         }
         let lower = model_id.trim().to_ascii_lowercase();
-        let canonical = normalize_model_name(&lower)?;
+        let terminal = lower.rsplit('/').next().unwrap_or(&lower);
+        let canonical = normalize_model_name(terminal).unwrap_or_else(|| terminal.to_string());
         let embedded_root = lower.split_once('/').map(|(root, _)| root);
         let hint = provider_id.or(embedded_root);
         match hint {
@@ -1255,6 +1263,8 @@ fn is_openai_full_request_272k_model(model_id: &str) -> bool {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-6-astra",
+        "gpt-6-astra-pro",
     ]
     .into_iter()
     .any(|base| matches_model_or_snapshot(model_id, base))
@@ -2400,7 +2410,6 @@ fn provider_prefix_matches_scoped_provider(prefix: &str, scoped_tags: &[String])
         .any(|prefix_tag| scoped_tags.iter().any(|scoped| scoped == prefix_tag))
 }
 
-
 fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
     if provider_id
         .and_then(provider_identity::canonical_provider)
@@ -2411,7 +2420,9 @@ fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Opti
     }
     let (prefix, terminal) = model_id
         .rsplit_once('/')
-        .map_or((None, model_id), |(prefix, terminal)| (Some(prefix), terminal));
+        .map_or((None, model_id), |(prefix, terminal)| {
+            (Some(prefix), terminal)
+        });
     let base = terminal.strip_suffix("-fast")?;
     if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
         return None;
@@ -2526,6 +2537,54 @@ fn exact_match_with_provider_prefixes(
 
 #[cfg(test)]
 mod tests {
+    fn openai_272k_pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            cache_read_input_token_cost: Some(input / 10.0),
+            cache_creation_input_token_cost: Some(input * 1.25),
+            input_cost_per_token_above_272k_tokens: Some(input * 2.0),
+            output_cost_per_token_above_272k_tokens: Some(output * 1.5),
+            cache_read_input_token_cost_above_272k_tokens: Some(input / 5.0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gpt6_astra_openai_hint_prefers_litellm_standard_over_openrouter_flex() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".to_string(), openai_272k_pricing(1e-5, 5e-5));
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openai/gpt-6-astra".to_string(),
+            openai_272k_pricing(5e-6, 2.5e-5),
+        );
+
+        let lookup = PricingLookup::new_with_models_dev(
+            litellm,
+            openrouter,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let result = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .expect("gpt-6-astra should resolve");
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gpt-6-astra");
+        assert_eq!(result.pricing.input_cost_per_token, Some(1e-5));
+        assert_eq!(result.pricing.output_cost_per_token, Some(5e-5));
+    }
+
+    #[test]
+    fn gpt6_astra_snapshot_is_openai_full_request_272k_model() {
+        assert!(is_openai_full_request_272k_model("gpt-6-astra"));
+        assert!(is_openai_full_request_272k_model("openai/gpt-6-astra"));
+        assert!(is_openai_full_request_272k_model("gpt-6-astra-20260903"));
+        assert!(is_openai_full_request_272k_model("gpt-6-astra-pro"));
+        assert!(!is_openai_full_request_272k_model("gpt-5.3"));
+    }
     use super::*;
 
     /// Mock LiteLLM data matching real API responses for OpenCode Zen models

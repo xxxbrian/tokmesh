@@ -204,6 +204,14 @@ fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 fn last_json_string_field(bytes: &[u8], field: &[u8]) -> Option<String> {
+    last_matching_json_string_field(bytes, field, |_| true)
+}
+
+fn last_matching_json_string_field(
+    bytes: &[u8],
+    field: &[u8],
+    accepts: impl Fn(&str) -> bool,
+) -> Option<String> {
     let mut marker = Vec::with_capacity(field.len() + 2);
     marker.push(b'"');
     marker.extend_from_slice(field);
@@ -224,7 +232,9 @@ fn last_json_string_field(bytes: &[u8], field: &[u8]) -> Option<String> {
             continue;
         };
         if let Ok(parsed) = serde_json::from_slice::<String>(&bytes[value..end]) {
-            found = Some(parsed);
+            if accepts(&parsed) {
+                found = Some(parsed);
+            }
         }
     }
     found
@@ -503,7 +513,7 @@ impl CarriedIdentity {
 }
 
 fn response_id_in(bytes: &[u8]) -> Option<String> {
-    last_json_string_field(bytes, b"id").filter(|value| {
+    last_matching_json_string_field(bytes, b"id", |value| {
         ["chatcmpl-", "cmpl-", "resp_"]
             .iter()
             .any(|prefix| value.starts_with(prefix))
@@ -562,6 +572,19 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn response_identity_survives_nested_tool_call_id() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, r#"[2026-07-09 10:00:00][INFO]
+Final response: {{"id":"chatcmpl-123","model":"local-model","choices":[{{"message":{{"role":"assistant","tool_calls":[{{"id":"call_456","type":"function","function":{{"name":"test","arguments":"{{}}"}}}}]}}}}],"usage":{{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}}"#).unwrap();
+        let messages = parse_lmstudio_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("lmstudio:chatcmpl-123")
+        );
+    }
 
     /// One response preceded by `pad_bytes` of log filler, so a record is only
     /// reachable by a parse that carries state across refills.

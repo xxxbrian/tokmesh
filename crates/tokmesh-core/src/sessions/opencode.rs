@@ -5,7 +5,7 @@
 //! - Legacy JSON files: ~/.local/share/opencode/storage/message/
 //!
 //! The SQLite message schema — and the driver that reads it — is shared with
-//! the other clients that adopted it; see [`super::opencode_schema`]. This
+//! the other clients that adopted it; see `super::opencode_schema`. This
 //! module keeps OpenCode's own legacy JSON file parser and its JSON-to-SQLite
 //! migration cache.
 
@@ -2125,6 +2125,22 @@ mod tests {
         assert_eq!(warm.messages.len(), 3);
         assert_eq!(output_tokens(&warm.messages, "msg_a"), 111);
         assert_eq!(output_tokens(&warm.messages, "msg_c"), 33);
+    }
+
+    #[test]
+    fn same_millisecond_rewrite_matches_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&path);
+        insert_timed_v1_message(&conn, "msg_a", 2_000, 11);
+        let cold = scan_opencode_sqlite(&path);
+        let state = cold.incremental.clone().unwrap();
+        touch_timed_v1_message(&conn, "msg_a", 2_000, 999);
+        let warm = rescan_opencode_sqlite(&path, &state, cold.messages)
+            .unwrap_or_else(|| scan_opencode_sqlite(&path));
+        let full = scan_opencode_sqlite(&path);
+        assert_eq!(output_tokens(&full.messages, "msg_a"), 999);
+        assert_eq!(output_tokens(&warm.messages, "msg_a"), 999);
     }
 
     #[test]

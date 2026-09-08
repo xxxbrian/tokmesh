@@ -548,11 +548,15 @@ pub fn submit_filters(
     (clients, since, until, year)
 }
 
+pub(crate) fn is_lock_contention(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(33)
+}
+
 pub fn try_acquire_run_lock(board: Leaderboard) -> Result<Option<AutosubmitRunLock>> {
     let (path, file) = open_run_lock_file(board)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(AutosubmitRunLock { _file: file })),
-        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(err) if is_lock_contention(&err) => Ok(None),
         Err(err) => Err(err)
             .with_context(|| format!("Could not lock autosubmit state at {}", path.display())),
     }

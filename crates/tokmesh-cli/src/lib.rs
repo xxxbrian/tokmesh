@@ -6,6 +6,7 @@ mod cursor;
 mod device;
 mod leaderboard;
 mod paths;
+mod process_liveness;
 mod trae;
 mod tui;
 mod warp;
