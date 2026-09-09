@@ -24,6 +24,17 @@ static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
 /// and should be excluded from pay-per-token cost estimation.
 const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
 
+/// Walk `source()` so a transport failure is not just "error sending request".
+pub fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
 pub struct PricingService {
     custom: CustomPricing,
     lookup: PricingLookup,
@@ -53,12 +64,13 @@ impl PricingService {
     ) -> Self {
         Self {
             custom,
-            lookup: PricingLookup::new_with_models_dev(
+            lookup: PricingLookup::new_with_archive(
                 litellm_data,
                 openrouter_data,
                 Self::build_cursor_overrides(),
                 Self::build_sakana_overrides(),
                 models_dev_data,
+                Self::build_archive_overrides(),
             ),
         }
     }
@@ -67,6 +79,138 @@ impl PricingService {
     // explains *why* these entries are dropped, not just *what* the code does.
     /// Filter out LiteLLM entries from subscription-based providers (e.g. github_copilot/)
     /// whose $0.00 pricing is meaningless for per-token cost estimation.
+
+    fn build_archive_overrides() -> HashMap<String, ModelPricing> {
+        /// `(model id, input, output, cache read, cache creation)`, per token.
+        /// Cache creation is `None` where the vendor publishes no such bucket
+        /// (Zhipu, Xiaomi and Tencent document cached-input reads but no
+        /// cache-write tariff): usage populating that bucket then stays
+        /// unpriced rather than billed at an invented rate.
+        type ArchivedRateRow = (&'static str, f64, f64, f64, Option<f64>);
+
+        // Every first-party Claude row the narrowest dataset still carries, so
+        // whichever one is retired next already has its last published rate
+        // here. models.dev is that dataset: as of 2026-09-02 it lists
+        // haiku-4-5, sonnet-4-5, sonnet-4-6, opus-4-5, opus-4-6, opus-4-7,
+        // opus-4-8, opus-5, sonnet-5 and the two fable-5 rows. The current
+        // flagships (opus-5, sonnet-5, fable-5*) are left out on purpose --
+        // nothing retires the model that is shipping.
+        let entries: &[ArchivedRateRow] = &[
+            // Claude Haiku 4.5: $1.00/$5.00 per 1M, $0.10 cache read, $1.25 cache write.
+            (
+                "anthropic/claude-haiku-4-5",
+                1e-6,
+                5e-6,
+                1e-7,
+                Some(1.25e-6),
+            ),
+            // Claude Sonnet 4.5 / 4.6: $3.00/$15.00 per 1M, $0.30 cache read,
+            // $3.75 cache write. 4.5 is the oldest Sonnet any of the three
+            // still carries.
+            (
+                "anthropic/claude-sonnet-4-5",
+                3e-6,
+                1.5e-5,
+                3e-7,
+                Some(3.75e-6),
+            ),
+            (
+                "anthropic/claude-sonnet-4-6",
+                3e-6,
+                1.5e-5,
+                3e-7,
+                Some(3.75e-6),
+            ),
+            // Claude Opus 4.5 / 4.6 / 4.7 / 4.8: $5.00/$25.00 per 1M, $0.50
+            // cache read, $6.25 cache write. 4.5 is the oldest Opus carried by
+            // all three, so it is the next one due to fall off -- LiteLLM and
+            // OpenRouter still list opus-4 and opus-4-1 (and LiteLLM
+            // claude-3-opus), but models.dev has already dropped them, so
+            // their rates cannot be cross-checked and they are not archived.
+            (
+                "anthropic/claude-opus-4-5",
+                5e-6,
+                2.5e-5,
+                5e-7,
+                Some(6.25e-6),
+            ),
+            (
+                "anthropic/claude-opus-4-6",
+                5e-6,
+                2.5e-5,
+                5e-7,
+                Some(6.25e-6),
+            ),
+            (
+                "anthropic/claude-opus-4-7",
+                5e-6,
+                2.5e-5,
+                5e-7,
+                Some(6.25e-6),
+            ),
+            (
+                "anthropic/claude-opus-4-8",
+                5e-6,
+                2.5e-5,
+                5e-7,
+                Some(6.25e-6),
+            ),
+            // Zhipu GLM-5.2 / GLM-5.3: $1.40/$4.40 per 1M, $0.26 cached
+            // input, no published cache-write tariff (cached-input storage
+            // is "Limited-time Free"). No live dataset carries a first-party
+            // row -- only the `z-ai/*` reseller keys -- so a `zhipu` hint
+            // resolved as an unverified guess. Verified 2026-09-03 against
+            // https://docs.z.ai/guides/overview/pricing ("Latest Models":
+            // GLM-5.3 and GLM-5.2 at $1.4 in / $0.26 cached / $4.4 out) and
+            // https://bigmodel.cn/pricing (8元 in / 28元 out / 2元
+            // cache-hit per M tokens, flat 1M context, no tiers).
+            ("zhipu/glm-5.2", 1.4e-6, 4.4e-6, 0.26e-6, None),
+            ("zhipu/glm-5.3", 1.4e-6, 4.4e-6, 0.26e-6, None),
+            ("zai/glm-5.2", 1.4e-6, 4.4e-6, 0.26e-6, None),
+            ("zai/glm-5.3", 1.4e-6, 4.4e-6, 0.26e-6, None),
+            // Xiaomi MiMo-V2.5: $0.14/$0.28 per 1M, $0.0028 cached input,
+            // no published cache-write tariff (only cache-hit vs cache-miss
+            // input). No live dataset carries a first-party row -- only the
+            // `openrouter/xiaomi/*` marketplace key -- so a `xiaomi` hint
+            // resolved as an unverified guess. Verified 2026-09-03 against
+            // https://mimo.mi.com/docs/en-US/pricing (MiMo-V2.5: $0.0028
+            // cache-hit / $0.14 cache-miss input / $0.28 output per MTok,
+            // flat to 1M context since the 2026-05-27 permanent cut).
+            ("xiaomi/mimo-v2.5", 0.14e-6, 0.28e-6, 0.0028e-6, None),
+            ("mimo/mimo-v2.5", 0.14e-6, 0.28e-6, 0.0028e-6, None),
+            // Tencent Hunyuan HY3: $0.132/$0.528 per 1M, $0.033 cache-hit;
+            // HY4-Preview: $0.834/$2.501 per 1M, $0.042 cache-hit. Neither
+            // publishes a separate cache-write tariff. No live dataset
+            // carries a first-party row -- only `deepinfra/tencent/*` and
+            // `crossmodel/tencent/*` reseller keys -- so a `tencent` hint
+            // resolved as an unverified guess. Verified 2026-09-03 against
+            // https://cloud.tencent.com/document/product/1823/130055
+            // (Hy3: 1元 in / 4元 out / 0.25元 cache-hit; Hy4 preview: 6元
+            // in / 18元 out / 0.3元 cache-hit per M tokens, flat) and the
+            // Intl sheet https://intl.cloud.tencent.com/document/product/1300/78937
+            // (USD numbers archived here, matching the datasets' currency).
+            ("tencent/hy3", 0.132e-6, 0.528e-6, 0.033e-6, None),
+            ("tencent/hy4-preview", 0.834e-6, 2.501e-6, 0.042e-6, None),
+            ("hunyuan/hy3", 0.132e-6, 0.528e-6, 0.033e-6, None),
+            ("hunyuan/hy4-preview", 0.834e-6, 2.501e-6, 0.042e-6, None),
+        ];
+
+        let mut overrides = HashMap::with_capacity(entries.len());
+        for (model_id, input, output, cache_read, cache_creation) in entries {
+            overrides.insert(
+                model_id.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(*input),
+                    output_cost_per_token: Some(*output),
+                    cache_read_input_token_cost: Some(*cache_read),
+                    cache_creation_input_token_cost: *cache_creation,
+                    ..Default::default()
+                },
+            );
+        }
+        overrides
+    }
+
     fn filter_litellm_data(
         mut data: HashMap<String, ModelPricing>,
     ) -> HashMap<String, ModelPricing> {
@@ -323,6 +467,41 @@ impl PricingService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archived_first_party_rates_cover_new_provider_families() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        for (provider, model, expected_input) in [
+            ("zhipu", "glm-5.3", 1.4e-6),
+            ("xiaomi", "mimo-v2.5", 0.14e-6),
+            ("tencent", "hy4-preview", 0.834e-6),
+        ] {
+            let row = service
+                .lookup_with_source_and_provider(model, None, Some(provider))
+                .unwrap();
+            assert_eq!(row.source, "Archive");
+            assert_eq!(row.pricing.input_cost_per_token, Some(expected_input));
+            assert_eq!(row.pricing.cache_creation_input_token_cost, None);
+        }
+    }
+
+    #[test]
+    fn first_party_archive_precedes_a_reseller_model_part_match() {
+        let service = PricingService::new(
+            HashMap::new(),
+            HashMap::from([(
+                "z-ai/glm-5.3".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(99.0),
+                    ..Default::default()
+                },
+            )]),
+        );
+        let row = service
+            .lookup_with_source_and_provider("glm-5.3", None, Some("zhipu"))
+            .unwrap();
+        assert_eq!(row.source, "Archive");
+        assert_eq!(row.pricing.input_cost_per_token, Some(1.4e-6));
+    }
     use super::*;
 
     fn model_pricing(input: f64, output: f64) -> ModelPricing {

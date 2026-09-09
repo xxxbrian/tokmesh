@@ -321,11 +321,19 @@ pub(crate) enum SqliteScan {
     NotPrepared,
     /// The statement prepared but the query could not execute.
     NotExecuted,
+    /// Iteration started and then stopped on a step error, so the rows handed
+    /// to the sink are a prefix of the result, not the result.
+    Incomplete,
 }
 
 impl SqliteScan {
-    /// True only when rows were iterated.
+    /// True when rows were iterated, complete or not.
     pub(crate) fn ran(self) -> bool {
+        matches!(self, SqliteScan::Ran | SqliteScan::Incomplete)
+    }
+
+    /// True only when every row was iterated.
+    pub(crate) fn completed(self) -> bool {
         matches!(self, SqliteScan::Ran)
     }
 
@@ -361,6 +369,17 @@ pub(crate) fn sqlite_for_each_row_on(
     what: Option<&str>,
     sink: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
 ) -> SqliteScan {
+    sqlite_for_each_row_on_with_params(conn, db_path, sql, &[], what, sink)
+}
+
+pub(crate) fn sqlite_for_each_row_on_with_params(
+    conn: &Connection,
+    db_path: &Path,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+    what: Option<&str>,
+    sink: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+) -> SqliteScan {
     let mut stmt = match conn.prepare(sql) {
         Ok(stmt) => stmt,
         Err(err) => {
@@ -376,7 +395,8 @@ pub(crate) fn sqlite_for_each_row_on(
         }
     };
 
-    let mut rows = match stmt.query([]) {
+    let mut stepped_off = false;
+    let mut rows = match stmt.query(params) {
         Ok(rows) => rows,
         Err(err) => {
             if let Some(what) = what {
@@ -415,12 +435,17 @@ pub(crate) fn sqlite_for_each_row_on(
                         "Failed to decode session row"
                     );
                 }
+                stepped_off = true;
                 break;
             }
         }
     }
 
-    SqliteScan::Ran
+    if stepped_off {
+        SqliteScan::Incomplete
+    } else {
+        SqliteScan::Ran
+    }
 }
 
 /// Open `db_path` read-only, run `sql`, and hand every row to `sink`.
@@ -612,6 +637,12 @@ pub(crate) struct CamelUsage {
     /// a disagreeing total must not silently override them.
     #[allow(dead_code)]
     pub(crate) total_tokens: Option<i64>,
+    /// Reasoning tokens, when the writer records them. OpenClaw adds this to
+    /// the block for turns it ran through Codex app-server, where it is the
+    /// Codex `reasoning_output_tokens` figure — a subset of `output`, never
+    /// added on top of it. Only [`CamelUsage::to_breakdown_with_reasoning`]
+    /// reads it; `gjc` keeps ignoring it through [`CamelUsage::to_breakdown`].
+    pub(crate) reasoning_tokens: Option<i64>,
     pub(crate) cost: Option<CamelCost>,
 }
 
@@ -626,6 +657,27 @@ impl CamelUsage {
             cache_write: self.cache_write.unwrap_or(0).max(0),
             reasoning: 0,
         }
+    }
+
+    /// [`CamelUsage::to_breakdown`] plus the `reasoningTokens` split.
+    ///
+    /// `reasoningTokens` is a subset of `output` (it is what OpenClaw copies
+    /// from Codex's `reasoning_output_tokens`, and OpenClaw's own `totalTokens`
+    /// never adds it on top), while `TokenBreakdown` buckets are additive. So
+    /// it is moved out of `output` into `reasoning` rather than carried in
+    /// both, clamped so a row claiming more reasoning than output cannot
+    /// drive the output bucket negative — the same correction the Codex
+    /// parser applies to the same figure.
+    pub(crate) fn to_breakdown_with_reasoning(&self) -> TokenBreakdown {
+        let mut breakdown = self.to_breakdown();
+        let reasoning = self
+            .reasoning_tokens
+            .unwrap_or(0)
+            .max(0)
+            .min(breakdown.output);
+        breakdown.output -= reasoning;
+        breakdown.reasoning = reasoning;
+        breakdown
     }
 }
 

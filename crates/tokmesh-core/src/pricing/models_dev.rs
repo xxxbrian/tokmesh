@@ -113,7 +113,7 @@ async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, reqwe
                     "[tokmesh] models.dev network error (attempt {}/{}): {}",
                     attempt + 1,
                     MAX_RETRIES,
-                    e
+                    crate::pricing::describe_error(&e)
                 );
                 last_error = Some(e);
                 if attempt < MAX_RETRIES - 1 {

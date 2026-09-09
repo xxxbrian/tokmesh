@@ -140,7 +140,7 @@ pub fn inferred_provider_from_model(model: &str) -> Option<&'static str> {
         return Some("anthropic");
     }
 
-    if lower.contains("gpt")
+    if contains_delimited(&lower, "gpt")
         || lower.contains("openai")
         || contains_delimited(&lower, "o1")
         || contains_delimited(&lower, "o3")

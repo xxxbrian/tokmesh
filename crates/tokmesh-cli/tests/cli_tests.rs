@@ -776,6 +776,7 @@ fn write_cursor_usage_cache(base: &Path) {
     let cache_dir = base.join(".config/tokmesh/cursor-cache");
     fs::create_dir_all(&cache_dir).unwrap();
     fs::write(cache_dir.join("usage.csv"), "Date,Model\n").unwrap();
+    fs::write(cache_dir.join("usage.json"), r#"{"usageEventsDisplay":[]}"#).unwrap();
 }
 
 fn write_cursor_credentials(base: &Path) {

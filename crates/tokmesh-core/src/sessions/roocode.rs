@@ -1,8 +1,8 @@
 //! Roo Code task parser
 //!
 //! Parses task-based logs from VS Code globalStorage directories:
-//! - tasks/<taskId>/ui_messages.json
-//! - tasks/<taskId>/api_conversation_history.json
+//! - `tasks/<taskId>/ui_messages.json`
+//! - `tasks/<taskId>/api_conversation_history.json`
 
 use super::utils::{extract_i64, parse_timestamp_str, read_file_or_none};
 use super::UnifiedMessage;
@@ -10,6 +10,7 @@ use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+pub(crate) const ROO_KILO_TASK_LOG_PARSER_BASE_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 struct UiMessageEntry {

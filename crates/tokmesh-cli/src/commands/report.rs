@@ -1374,6 +1374,9 @@ fn load_pricing_service() -> Option<std::sync::Arc<PricingService>> {
 /// per-model rates and every billed token type (input/output/cache read/cache
 /// write/reasoning). Returns 0.0 when no pricing dataset is available.
 fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f64 {
+    if msg.cost_source == tokmesh_core::CostSource::ProviderReported {
+        return msg.cost;
+    }
     let Some(pricing) = pricing else {
         return 0.0;
     };
@@ -1453,6 +1456,8 @@ mod tests {
             duration_ms: None,
             message_count: 1,
             agent: None,
+            cost: 0.0,
+            cost_source: tokmesh_core::CostSource::Unknown,
         }
     }
 

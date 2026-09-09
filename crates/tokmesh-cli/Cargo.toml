@@ -76,6 +76,12 @@ arboard = "3"
 [target.'cfg(unix)'.dependencies]
 signal-hook = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# windows-sys 0.61 is already in the lockfile via tokio/mio. Unlike the windows
+# crate it needs no Win32_Foundation feature — foundation types live in
+# windows_sys::core. Used for Copilot gh token via CredReadW.
+windows-sys = { version = "0.61", features = ["Win32_Security_Credentials"] }
+
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.0"

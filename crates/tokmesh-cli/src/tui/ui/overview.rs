@@ -1,5 +1,6 @@
+use super::widgets::{ambient_stable_scrollbar, AMBIENT_STABLE_BORDER_SET};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::bar_chart::{render_stacked_bar_chart, ModelSegment, StackedBarData};
 use super::widgets::{format_tokens, viewport_scrollbar_state};
@@ -234,6 +235,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(theme_border))
         .title(Span::styled(
             format!(" {} ", title),
@@ -369,11 +371,7 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
     }
 
     if models_len > items_per_page {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"))
-            .track_symbol(Some("│"))
-            .thumb_symbol("█");
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(models_len, scroll_offset, items_per_page);

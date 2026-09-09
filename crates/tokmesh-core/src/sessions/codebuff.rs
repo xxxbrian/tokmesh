@@ -22,6 +22,7 @@ use serde_json::Value;
 use std::path::Path;
 
 const DEFAULT_MODEL: &str = "codebuff-unknown";
+pub(crate) const CODEBUFF_CHAT_PARSER_BASE_VERSION: u32 = 1;
 
 /// Parse a single `chat-messages.json` file into UnifiedMessages.
 pub fn parse_codebuff_file(path: &Path) -> Vec<UnifiedMessage> {

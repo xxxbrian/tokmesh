@@ -20,7 +20,7 @@ use super::codex_login::{
 };
 use super::data::{
     AgentUsage, DailyUsage, DataLoader, HourlyUsage, MinutelyUsage, ModelUsage, MonthlyUsage,
-    SessionUsage, TokenBreakdown, UsageData,
+    ProjectUsage, SessionUsage, TokenBreakdown, UsageData,
 };
 use super::privacy::looks_like_email;
 use super::settings::Settings;
@@ -29,6 +29,7 @@ use super::ui::dialog::{ClientPickerDialog, ConfirmDialog, DialogStack};
 use super::ui::widgets::{get_model_color, get_provider_from_model, get_provider_shade};
 
 /// Configuration for TUI initialization
+#[derive(Default)]
 pub struct TuiConfig {
     pub theme: String,
     pub refresh: u64,
@@ -62,6 +63,7 @@ pub enum Tab {
     Minutely,
     Monthly,
     Sessions,
+    Projects,
     Stats,
     Agents,
 }
@@ -77,6 +79,7 @@ impl Tab {
             Tab::Minutely,
             Tab::Monthly,
             Tab::Sessions,
+            Tab::Projects,
             Tab::Stats,
             Tab::Agents,
         ]
@@ -92,6 +95,7 @@ impl Tab {
             Tab::Minutely => "Minutely",
             Tab::Monthly => "Monthly",
             Tab::Sessions => "Sessions",
+            Tab::Projects => "Projects",
             Tab::Stats => "Stats",
             Tab::Agents => "Agents",
         }
@@ -107,6 +111,7 @@ impl Tab {
             Tab::Minutely => "Min",
             Tab::Monthly => "Mon",
             Tab::Sessions => "Ses",
+            Tab::Projects => "Prj",
             Tab::Stats => "Sta",
             Tab::Agents => "Agt",
         }
@@ -121,7 +126,8 @@ impl Tab {
             Tab::Hourly => Tab::Minutely,
             Tab::Minutely => Tab::Monthly,
             Tab::Monthly => Tab::Sessions,
-            Tab::Sessions => Tab::Stats,
+            Tab::Sessions => Tab::Projects,
+            Tab::Projects => Tab::Stats,
             Tab::Stats => Tab::Agents,
             Tab::Agents => Tab::Overview,
         }
@@ -137,7 +143,8 @@ impl Tab {
             Tab::Minutely => Tab::Hourly,
             Tab::Monthly => Tab::Minutely,
             Tab::Sessions => Tab::Monthly,
-            Tab::Stats => Tab::Sessions,
+            Tab::Projects => Tab::Sessions,
+            Tab::Stats => Tab::Projects,
             Tab::Agents => Tab::Stats,
         }
     }
@@ -395,7 +402,11 @@ impl App {
                 .parse()
                 .unwrap_or_else(|_| settings.theme_name())
         };
-        let theme = Theme::from_name_for_current_terminal(theme_name);
+        let theme = if settings.tui_light_mode {
+            Theme::from_name_for_current_terminal_light(theme_name)
+        } else {
+            Theme::from_name_for_current_terminal(theme_name)
+        };
 
         let enabled_clients: HashSet<ClientFilter> = if let Some(ref cli_clients) = config.clients {
             // CLI-provided filter list. Each entry is the canonical
@@ -850,6 +861,9 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.set_sort(SortField::Tokens);
+            }
+            KeyCode::Char('L') => {
+                self.toggle_light_mode();
             }
             KeyCode::Char('d') => {
                 self.set_sort(SortField::Date);
@@ -1778,6 +1792,7 @@ impl App {
             }
             Tab::Monthly => self.data.monthly.len(),
             Tab::Sessions => self.data.sessions.len(),
+            Tab::Projects => self.data.projects.len(),
             Tab::Stats => {
                 if self.selected_graph_cell.is_some() {
                     self.stats_breakdown_total_lines
@@ -1854,7 +1869,11 @@ impl App {
 
     fn cycle_theme(&mut self) {
         let new_theme = self.theme.name.next();
-        self.theme = Theme::from_name_for_current_terminal(new_theme);
+        self.theme = if self.settings.tui_light_mode {
+            Theme::from_name_for_current_terminal_light(new_theme)
+        } else {
+            Theme::from_name_for_current_terminal(new_theme)
+        };
         self.dialog_stack.set_theme(self.theme.clone());
         self.settings.set_theme(new_theme);
         if let Err(e) = self.settings.save_preserving_autosubmit() {
@@ -1865,6 +1884,19 @@ impl App {
             ));
         } else {
             self.set_status(&format!("Theme: {}", new_theme.as_str()));
+        }
+    }
+
+    fn toggle_light_mode(&mut self) {
+        self.settings.tui_light_mode = !self.settings.tui_light_mode;
+        self.theme = if self.settings.tui_light_mode {
+            Theme::from_name_for_current_terminal_light(self.theme.name)
+        } else {
+            Theme::from_name_for_current_terminal(self.theme.name)
+        };
+        self.dialog_stack.set_theme(self.theme.clone());
+        if let Err(error) = self.settings.save_preserving_autosubmit() {
+            self.set_status(&format!("Theme save failed: {error}"));
         }
     }
 
@@ -2132,6 +2164,10 @@ impl App {
                     )
                 }),
             Tab::Stats | Tab::Usage => None,
+            Tab::Projects => self
+                .get_sorted_projects()
+                .get(self.selected_index)
+                .map(|p| format!("{}: {} tokens, ${:.4}", p.label, p.tokens.total(), p.cost)),
         };
 
         if let Some(text) = text {
@@ -2531,56 +2567,93 @@ impl App {
 
     pub fn get_sorted_sessions(&self) -> Vec<&SessionUsage> {
         let mut sessions: Vec<&SessionUsage> = self.data.sessions.iter().collect();
-
-        let tie_breaker = |a: &&SessionUsage, b: &&SessionUsage| {
-            a.client
-                .cmp(&b.client)
-                .then_with(|| a.session_id.cmp(&b.session_id))
-        };
-
-        match (self.sort_field, self.sort_direction) {
-            (SortField::Cost, SortDirection::Descending) => sessions.sort_by(|a, b| {
-                b.cost
-                    .total_cmp(&a.cost)
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Cost, SortDirection::Ascending) => sessions.sort_by(|a, b| {
-                a.cost
-                    .total_cmp(&b.cost)
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Tokens, SortDirection::Descending) => sessions.sort_by(|a, b| {
-                b.tokens
-                    .total()
-                    .cmp(&a.tokens.total())
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Tokens, SortDirection::Ascending) => sessions.sort_by(|a, b| {
-                a.tokens
-                    .total()
-                    .cmp(&b.tokens.total())
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            // "Date" maps to last_active for sessions: most recently active
-            // session first when descending, oldest active first when ascending.
-            (SortField::Date, SortDirection::Descending) => sessions.sort_by(|a, b| {
-                b.last_active_ms
-                    .cmp(&a.last_active_ms)
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Date, SortDirection::Ascending) => sessions.sort_by(|a, b| {
-                a.last_active_ms
-                    .cmp(&b.last_active_ms)
-                    .then_with(|| tie_breaker(a, b))
-            }),
-        }
-
+        sort_usage_rows(
+            &mut sessions,
+            self.sort_field,
+            self.sort_direction,
+            |a, b| {
+                a.client
+                    .cmp(&b.client)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            },
+        );
         sessions
     }
+
+    pub fn get_sorted_projects(&self) -> Vec<&ProjectUsage> {
+        let mut projects: Vec<&ProjectUsage> = self.data.projects.iter().collect();
+        sort_usage_rows(
+            &mut projects,
+            self.sort_field,
+            self.sort_direction,
+            |a, b| {
+                a.label
+                    .cmp(&b.label)
+                    .then_with(|| a.workspace_key.cmp(&b.workspace_key))
+                    .then_with(|| a.group_key.cmp(&b.group_key))
+            },
+        );
+        projects
+    }
+}
+
+/// The columns the Sessions and Projects tabs sort on. Both tabs order rows
+/// the same way -- the chosen metric, then most recent activity, then a
+/// tab-specific tie-breaker that names the row -- so the ordering lives in
+/// [`sort_usage_rows`] and each tab supplies only its tie-breaker.
+trait SortableUsage {
+    fn cost(&self) -> f64;
+    fn token_total(&self) -> u64;
+    fn last_active_ms(&self) -> i64;
+}
+
+impl SortableUsage for SessionUsage {
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+    fn token_total(&self) -> u64 {
+        self.tokens.total()
+    }
+    fn last_active_ms(&self) -> i64 {
+        self.last_active_ms
+    }
+}
+
+impl SortableUsage for ProjectUsage {
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+    fn token_total(&self) -> u64 {
+        self.tokens.total()
+    }
+    fn last_active_ms(&self) -> i64 {
+        self.last_active_ms
+    }
+}
+
+/// Sort `rows` by `field` in `direction`, then by most recent activity, then
+/// by `tie_breaker`. "Date" is last activity itself: most recently active
+/// first when descending, oldest first when ascending.
+fn sort_usage_rows<T: SortableUsage>(
+    rows: &mut [&T],
+    field: SortField,
+    direction: SortDirection,
+    tie_breaker: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    let metric = |a: &T, b: &T| match field {
+        SortField::Cost => a.cost().total_cmp(&b.cost()),
+        SortField::Tokens => a.token_total().cmp(&b.token_total()),
+        SortField::Date => a.last_active_ms().cmp(&b.last_active_ms()),
+    };
+    rows.sort_by(|a, b| {
+        let primary = match direction {
+            SortDirection::Descending => metric(b, a),
+            SortDirection::Ascending => metric(a, b),
+        };
+        primary
+            .then_with(|| b.last_active_ms().cmp(&a.last_active_ms()))
+            .then_with(|| tie_breaker(a, b))
+    })
 }
 
 #[cfg(test)]
@@ -2598,7 +2671,7 @@ mod tests {
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 10);
+        assert_eq!(tabs.len(), 11);
         assert_eq!(tabs[0], Tab::Overview);
         assert_eq!(tabs[1], Tab::Usage);
         assert_eq!(tabs[2], Tab::Models);
@@ -2607,8 +2680,9 @@ mod tests {
         assert_eq!(tabs[5], Tab::Minutely);
         assert_eq!(tabs[6], Tab::Monthly);
         assert_eq!(tabs[7], Tab::Sessions);
-        assert_eq!(tabs[8], Tab::Stats);
-        assert_eq!(tabs[9], Tab::Agents);
+        assert_eq!(tabs[8], Tab::Projects);
+        assert_eq!(tabs[9], Tab::Stats);
+        assert_eq!(tabs[10], Tab::Agents);
     }
 
     #[test]
@@ -2620,7 +2694,8 @@ mod tests {
         assert_eq!(Tab::Hourly.next(), Tab::Minutely);
         assert_eq!(Tab::Minutely.next(), Tab::Monthly);
         assert_eq!(Tab::Monthly.next(), Tab::Sessions);
-        assert_eq!(Tab::Sessions.next(), Tab::Stats);
+        assert_eq!(Tab::Sessions.next(), Tab::Projects);
+        assert_eq!(Tab::Projects.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
         assert_eq!(Tab::Agents.next(), Tab::Overview);
     }
@@ -2635,7 +2710,8 @@ mod tests {
         assert_eq!(Tab::Minutely.prev(), Tab::Hourly);
         assert_eq!(Tab::Monthly.prev(), Tab::Minutely);
         assert_eq!(Tab::Sessions.prev(), Tab::Monthly);
-        assert_eq!(Tab::Stats.prev(), Tab::Sessions);
+        assert_eq!(Tab::Projects.prev(), Tab::Sessions);
+        assert_eq!(Tab::Stats.prev(), Tab::Projects);
         assert_eq!(Tab::Agents.prev(), Tab::Stats);
     }
 
@@ -2649,6 +2725,7 @@ mod tests {
         assert_eq!(Tab::Minutely.as_str(), "Minutely");
         assert_eq!(Tab::Monthly.as_str(), "Monthly");
         assert_eq!(Tab::Sessions.as_str(), "Sessions");
+        assert_eq!(Tab::Projects.as_str(), "Projects");
         assert_eq!(Tab::Stats.as_str(), "Stats");
     }
 
@@ -2662,6 +2739,7 @@ mod tests {
         assert_eq!(Tab::Minutely.short_name(), "Min");
         assert_eq!(Tab::Monthly.short_name(), "Mon");
         assert_eq!(Tab::Sessions.short_name(), "Ses");
+        assert_eq!(Tab::Projects.short_name(), "Prj");
         assert_eq!(Tab::Stats.short_name(), "Sta");
     }
 
@@ -3549,6 +3627,9 @@ mod tests {
         assert_eq!(app.current_tab, Tab::Sessions);
 
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Projects);
+
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.current_tab, Tab::Stats);
 
         app.handle_key_event(key(KeyCode::Tab));
@@ -3568,6 +3649,9 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Stats);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Projects);
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Sessions);
@@ -3605,6 +3689,7 @@ mod tests {
             Tab::Minutely,
             Tab::Monthly,
             Tab::Sessions,
+            Tab::Projects,
             Tab::Stats,
             Tab::Agents,
             Tab::Overview,

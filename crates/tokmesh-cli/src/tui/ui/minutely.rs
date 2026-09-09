@@ -1,8 +1,7 @@
+use super::widgets::ambient_stable_scrollbar;
 use chrono::Timelike;
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
     format_cache_hit_rate, format_cost, format_tokens, total_tokens_cell, viewport_scrollbar_state,
@@ -67,12 +66,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else if has_turn_data {
         vec![
-            "Minute", "Source", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×",
+            "Minute", "Source", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕",
             "Total", "Cost",
         ]
     } else {
         vec![
-            "Minute", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×", "Total",
+            "Minute", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕", "Total",
             "Cost",
         ]
     };
@@ -80,8 +79,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -144,9 +143,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 vec![
                     Cell::from(minute.datetime.format("%m/%d %H:%M").to_string()).style(
                         if is_current {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
+                            app.theme.hint_key_style().add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
                         },
@@ -157,9 +154,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 let mut cells = vec![
                     Cell::from(minute.datetime.format("%m-%d %H:%M").to_string()).style(
                         if is_current {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
+                            app.theme.hint_key_style().add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
                         },
@@ -184,9 +179,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 let mut cells = vec![
                     Cell::from(minute.datetime.format("%Y-%m-%d %H:%M").to_string()).style(
                         if is_current {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
+                            app.theme.hint_key_style().add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().add_modifier(Modifier::BOLD)
                         },
@@ -214,7 +207,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                         minute.tokens.input,
                         minute.tokens.cache_write,
                     ))
-                    .style(Style::default().fg(Color::Cyan)),
+                    .style(app.theme.count_style()),
                     total_tokens_cell(minute.tokens.total(), &app.theme),
                     Cell::from(format_cost(minute.cost)).style(Style::default().fg(Color::Green)),
                 ]);
@@ -290,9 +283,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if minutely_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(minutely_len, scroll_offset, visible_height);

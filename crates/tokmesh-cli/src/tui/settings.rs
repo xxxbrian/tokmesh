@@ -182,6 +182,8 @@ pub struct Settings {
     /// existed loading cleanly; an absent or empty map means no folding.
     #[serde(default)]
     pub model_aliases: tokmesh_core::ModelAliasMap,
+    #[serde(default)]
+    pub tui_light_mode: bool,
 }
 
 /// Lossy deserializer for `defaultClients`: accepts an array of arbitrary
@@ -235,6 +237,7 @@ impl Default for Settings {
             tokscale_autosubmit: AutosubmitSettings::default(),
             tokensci_autosubmit: AutosubmitSettings::default(),
             model_aliases: tokmesh_core::ModelAliasMap::default(),
+            tui_light_mode: false,
         }
     }
 }
