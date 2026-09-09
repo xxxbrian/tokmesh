@@ -1886,6 +1886,81 @@ fn test_submit_dry_run_json_is_pure_json_and_needs_no_token() {
 }
 
 #[test]
+fn test_tokensci_omp_compatibility_in_real_dry_run_payload() {
+    let tmp = create_empty_fixture_dir();
+    for (name, input, output) in [("pi", 10, 2), ("omp", 20, 4)] {
+        let root = tmp.path().join(format!(".{name}/agent/sessions"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("session.jsonl"), format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{name}-fixture\",\"timestamp\":\"2026-09-08T12:00:00Z\"}}\n{{\"type\":\"message\",\"id\":\"{name}-message\",\"timestamp\":\"2026-09-08T12:00:01Z\",\"message\":{{\"role\":\"assistant\",\"model\":\"gpt-5.3\",\"provider\":\"openai\",\"usage\":{{\"input\":{input},\"output\":{output},\"cacheRead\":0,\"cacheWrite\":0}}}}}}\n"
+        )).unwrap();
+    }
+    let payload = |board: &str, replace: bool| {
+        let mut command = leaderboard_cmd_with_home(tmp.path());
+        command.args([board, "submit", "--client", "pi,omp", "--dry-run", "--json"]);
+        if replace {
+            command.args([
+                "--replace",
+                "--since",
+                "2026-09-01",
+                "--until",
+                "2026-09-09",
+            ]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    for replace in [false, true] {
+        let json = payload("tokensci", replace);
+        assert_eq!(json["summary"]["clients"], serde_json::json!(["pi"]));
+        assert_eq!(json["summary"]["totalTokens"], 36);
+        let rows = json["contributions"][0]["clients"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["client"], "pi");
+        assert_eq!(rows[0]["tokens"]["input"], 30);
+        assert_eq!(rows[0]["tokens"]["output"], 6);
+        assert_eq!(rows[0]["messages"], 2);
+        assert_eq!(rows[0]["provenance"]["messageCount"], 2);
+        let manifest = json["clientManifest"]["clients"].as_array().unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0]["client"], "pi");
+        assert_eq!(manifest[0].get("coverage").is_some(), replace);
+    }
+    let json = payload("tokscale", false);
+    assert_eq!(json["summary"]["clients"], serde_json::json!(["omp", "pi"]));
+    assert_eq!(json["summary"]["totalTokens"], 36);
+    assert_eq!(
+        json["contributions"][0]["clients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    leaderboard_cmd_with_home(tmp.path())
+        .args([
+            "tokensci",
+            "submit",
+            "--client",
+            "omp",
+            "--replace",
+            "--since",
+            "2026-09-01",
+            "--until",
+            "2026-09-09",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--client pi,omp"));
+}
+
+#[test]
 fn test_submit_replace_validates_filtered_client_contributions() {
     let tmp = create_temp_fixture_dir();
     leaderboard_cmd_with_home(tmp.path())
