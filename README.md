@@ -100,6 +100,8 @@ tokmesh tokensci submit --dry-run --json   # full JSON body (no upload)
 `tokmesh tokensci submit --replace --client <id> --since YYYY-MM-DD --until YYYY-MM-DD`
 authoritatively replaces that client's bounded date range; missing local days are removed remotely.
 
+tokens.ci groups Oh My Pi (`omp`) usage under `pi`, matching its own CLI. Tokmesh merges matching daily model/provider rows for that upload while keeping Pi and Oh My Pi separate in local reports and on tokscale.ai. For tokens.ci, replacing this shared history requires explicit `--client pi,omp`; replacing only one could erase the other client's history.
+
 ## TODO
 
 - Optional self-hosted private cloud for detailed personal history (not started)

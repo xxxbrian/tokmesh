@@ -4531,6 +4531,78 @@ fn build_submit_client_manifest(
     }
 }
 
+// tokens.ci's own CLI scans ~/.omp/agent/sessions under its Pi client.
+// Keep this wire compatibility separate from local and tokscale identities.
+fn tokensci_client_id(client: &str) -> &str {
+    match client {
+        "omp" => "pi",
+        _ => client,
+    }
+}
+
+fn tokensci_compatible_graph(graph: &tokmesh_core::GraphResult) -> tokmesh_core::GraphResult {
+    use std::collections::BTreeMap;
+
+    let mut graph = graph.clone();
+    graph.summary.clients = graph
+        .summary
+        .clients
+        .iter()
+        .map(|client| tokensci_client_id(client).to_string())
+        .collect();
+    graph.summary.clients.sort();
+    graph.summary.clients.dedup();
+    for day in &mut graph.contributions {
+        let mut rows: BTreeMap<(String, String, String), tokmesh_core::ClientContribution> =
+            BTreeMap::new();
+        for mut row in std::mem::take(&mut day.clients) {
+            row.client = tokensci_client_id(&row.client).to_string();
+            let key = (
+                row.client.clone(),
+                row.model_id.clone(),
+                row.provider_id.clone(),
+            );
+            match rows.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let merged = entry.get_mut();
+                    merged.tokens.input = merged.tokens.input.saturating_add(row.tokens.input);
+                    merged.tokens.output = merged.tokens.output.saturating_add(row.tokens.output);
+                    merged.tokens.cache_read = merged
+                        .tokens
+                        .cache_read
+                        .saturating_add(row.tokens.cache_read);
+                    merged.tokens.cache_write = merged
+                        .tokens
+                        .cache_write
+                        .saturating_add(row.tokens.cache_write);
+                    merged.tokens.reasoning =
+                        merged.tokens.reasoning.saturating_add(row.tokens.reasoning);
+                    merged.cost += row.cost;
+                    merged.messages = merged.messages.saturating_add(row.messages);
+                }
+            }
+        }
+        day.clients = rows.into_values().collect();
+    }
+    graph
+}
+
+fn validate_tokensci_replacement_scope(
+    replacement: Option<&SubmitReplacementCoverage>,
+) -> Result<()> {
+    if let Some(replacement) = replacement {
+        let pi = replacement.clients.iter().any(|client| client == "pi");
+        let omp = replacement.clients.iter().any(|client| client == "omp");
+        if pi != omp {
+            anyhow::bail!("tokens.ci stores Pi and Oh My Pi together; --replace requires --client pi,omp so it cannot erase the other client's history");
+        }
+    }
+    Ok(())
+}
+
 /// Build the leaderboard submit/export body.
 ///
 /// - `Leaderboard::Tokscale`: tokscale.ai shape (no clientManifest / provenance).
@@ -4543,6 +4615,20 @@ fn to_ts_token_contribution_data(
 ) -> TsTokenContributionData {
     let tokensci = board == leaderboard::Leaderboard::TokensCi;
     let include_submit_provenance = tokensci && device.is_some();
+    let compatible_graph = tokensci.then(|| tokensci_compatible_graph(graph));
+    let graph = compatible_graph.as_ref().unwrap_or(graph);
+    let compatible_replacement = replacement.filter(|_| tokensci).map(|replacement| {
+        let mut replacement = replacement.clone();
+        replacement.clients = replacement
+            .clients
+            .iter()
+            .map(|client| tokensci_client_id(client).to_string())
+            .collect();
+        replacement.clients.sort();
+        replacement.clients.dedup();
+        replacement
+    });
+    let replacement = compatible_replacement.as_ref().or(replacement);
 
     TsTokenContributionData {
         meta: TsExportMeta {
@@ -5609,6 +5695,10 @@ fn run_submit_command(
         mode,
     } = options;
 
+    if board == leaderboard::Leaderboard::TokensCi {
+        validate_tokensci_replacement_scope(replacement.as_ref())?;
+    }
+
     let auth_token = if dry_run {
         None
     } else {
@@ -5741,7 +5831,23 @@ fn run_submit_command(
         );
         println!(
             "{}",
-            format!("    Clients: {}", graph_result.summary.clients.join(", ")).bright_black()
+            format!(
+                "    Clients: {}",
+                graph_result
+                    .summary
+                    .clients
+                    .iter()
+                    .map(|client| if board == leaderboard::Leaderboard::TokensCi {
+                        tokensci_client_id(client)
+                    } else {
+                        client.as_str()
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .bright_black()
         );
         println!(
             "{}",
@@ -8104,6 +8210,167 @@ mod tests {
         );
         assert_ne!(tokscale.meta.version, graph.meta.version);
         assert_ne!(tokensci.meta.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn tokensci_submit_merges_omp_with_pi_without_changing_totals() {
+        let graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-09-08",
+            180,
+            vec![
+                client_contribution("pi", "gpt-5", "openai", 150, 1.5, 2),
+                client_contribution("omp", "gpt-5", "openai", 15, 0.25, 3),
+                client_contribution("omp", "gpt-5", "other-provider", 7, 0.5, 1),
+                client_contribution("omp", "gpt-4o", "openai", 8, 0.75, 1),
+            ],
+        )]);
+        let device = device::SubmitDevice {
+            id: "test-device".into(),
+            name: None,
+        };
+        let payload = to_ts_token_contribution_data(
+            &graph,
+            Some(&device),
+            leaderboard::Leaderboard::TokensCi,
+            None,
+        );
+        assert_eq!(payload.summary.clients, vec!["pi"]);
+        assert_eq!(payload.client_manifest.as_ref().unwrap().clients.len(), 1);
+        assert_eq!(
+            payload.client_manifest.as_ref().unwrap().clients[0].client,
+            "pi"
+        );
+        assert_eq!(payload.contributions[0].clients.len(), 3);
+        let merged = payload.contributions[0]
+            .clients
+            .iter()
+            .find(|row| row.model_id == "gpt-5" && row.provider_id.as_deref() == Some("openai"))
+            .unwrap();
+        assert_eq!(merged.client, "pi");
+        assert_eq!(merged.tokens.input, 165);
+        assert_eq!(merged.cost, 1.75);
+        assert_eq!(merged.messages, 5);
+        let provenance = merged.provenance.as_ref().unwrap();
+        assert_eq!(
+            (
+                provenance.schema_version,
+                provenance.message_count,
+                provenance.model_count
+            ),
+            (1, 5, 1)
+        );
+        assert_eq!(payload.summary.total_tokens, graph.summary.total_tokens);
+        assert_eq!(payload.summary.total_cost, graph.summary.total_cost);
+        assert_eq!(
+            payload.contributions[0].totals.tokens,
+            graph.contributions[0].totals.tokens
+        );
+        assert_eq!(
+            payload.contributions[0].totals.cost,
+            graph.contributions[0].totals.cost
+        );
+        assert_eq!(
+            payload.contributions[0].totals.messages,
+            graph.contributions[0].totals.messages
+        );
+        let tokscale = to_ts_token_contribution_data(
+            &graph,
+            Some(&device),
+            leaderboard::Leaderboard::Tokscale,
+            None,
+        );
+        assert_eq!(tokscale.summary.clients, vec!["omp", "pi"]);
+        assert_eq!(tokscale.contributions[0].clients.len(), 4);
+        assert_eq!(graph.summary.clients, vec!["omp", "pi"]);
+    }
+
+    #[test]
+    fn tokensci_submit_preserves_every_token_bucket_when_clients_merge() {
+        let mut first = client_contribution("pi", "gpt-5", "openai", 0, 1.0, 1);
+        first.tokens = tokmesh_core::TokenBreakdown {
+            input: 10,
+            output: 20,
+            cache_read: 30,
+            cache_write: 40,
+            reasoning: 50,
+        };
+        let mut second = client_contribution("omp", "gpt-5", "openai", 0, 0.5, 2);
+        second.tokens = tokmesh_core::TokenBreakdown {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            reasoning: 5,
+        };
+        let graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-09-08",
+            165,
+            vec![first, second],
+        )]);
+        let payload =
+            to_ts_token_contribution_data(&graph, None, leaderboard::Leaderboard::TokensCi, None);
+        let row = &payload.contributions[0].clients[0];
+        assert_eq!(
+            (
+                row.tokens.input,
+                row.tokens.output,
+                row.tokens.cache_read,
+                row.tokens.cache_write,
+                row.tokens.reasoning
+            ),
+            (11, 22, 33, 44, 55)
+        );
+        assert_eq!(row.cost, 1.5);
+        assert_eq!(row.messages, 3);
+        assert!(row.provenance.is_none());
+    }
+
+    #[test]
+    fn tokensci_replacement_requires_the_complete_shared_pi_scope() {
+        let coverage = |clients: &[&str]| SubmitReplacementCoverage {
+            clients: clients.iter().map(|client| client.to_string()).collect(),
+            start: "2026-09-01".into(),
+            end: "2026-09-08".into(),
+        };
+        for clients in [&["omp"][..], &["pi"][..], &["codex", "omp"][..]] {
+            assert!(
+                validate_tokensci_replacement_scope(Some(&coverage(clients)))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--client pi,omp")
+            );
+        }
+        validate_tokensci_replacement_scope(None).unwrap();
+        validate_tokensci_replacement_scope(Some(&coverage(&["codex"]))).unwrap();
+        let replacement = coverage(&["pi", "omp"]);
+        validate_tokensci_replacement_scope(Some(&replacement)).unwrap();
+        let graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-09-08",
+            30,
+            vec![
+                client_contribution("pi", "gpt-5", "openai", 10, 1.0, 1),
+                client_contribution("omp", "gpt-5", "openai", 20, 2.0, 2),
+            ],
+        )]);
+        let device = device::SubmitDevice {
+            id: "test-device".into(),
+            name: None,
+        };
+        let payload = to_ts_token_contribution_data(
+            &graph,
+            Some(&device),
+            leaderboard::Leaderboard::TokensCi,
+            Some(&replacement),
+        );
+        let manifest = payload.client_manifest.unwrap();
+        assert_eq!(manifest.clients.len(), 1);
+        assert_eq!(manifest.clients[0].client, "pi");
+        assert_eq!(manifest.clients[0].parser_revision, 1);
+        let sent = manifest.clients[0].coverage.as_ref().unwrap();
+        assert_eq!(
+            (&sent.start, &sent.end, sent.missing_data),
+            (&replacement.start, &replacement.end, "tombstone")
+        );
     }
 
     #[test]
